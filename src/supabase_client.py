@@ -65,7 +65,7 @@ def check_supabase_connection(client: Client) -> dict:
     columns = {
         "refcoco_annotations": ANNOTATION_FIELDS,
         "runs": (
-            "id,main_model,challenger_model,weak_model,strong_model,acceptance,"
+            "id,main_model,challenger_model,weak_model,strong_model,judge_model,"
             "iou_threshold,min_iou_gap,max_rounds,status,finished_at"
         ),
         "rounds": (
@@ -165,7 +165,7 @@ class SupabaseStore:
                             "challenger_model",
                             "weak_model",
                             "strong_model",
-                            "acceptance",
+                            "judge_model",
                             "iou_threshold",
                             "min_iou_gap",
                             "max_rounds",
@@ -211,15 +211,16 @@ class SupabaseStore:
             "finish the run",
         )
 
-    def iter_accepted_examples(self, run_id: str) -> Iterator[AcceptedExample]:
-        # Accepted rounds of one run, joined to their annotation for image, size and box.
+    def iter_accepted_examples(self, run_ids: list[str]) -> Iterator[AcceptedExample]:
+        # Accepted rounds of the given runs, joined to their annotation for image, size and box.
         offset = 0
         while True:
             rows = _execute(
                 self.client.table("rounds")
                 .select(ACCEPTED_FIELDS)
-                .eq("run_id", run_id)
+                .in_("run_id", run_ids)
                 .eq("status", "accepted")
+                .order("run_id")
                 .order("ref_id")
                 .order("round_number")
                 .range(offset, offset + PAGE_SIZE - 1),

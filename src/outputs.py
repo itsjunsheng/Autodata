@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from dataset import load_image
 from google_drive import GoogleDrive, validate_file_id
 from models import AcceptedExample, Result, Round, Sample
+from solver import grounding_prompt
 from supabase_client import SupabaseStore
 
 
@@ -76,12 +77,7 @@ def _training_record(example: AcceptedExample, image_path: str) -> dict:
         "conversations": [
             {
                 "from": "human",
-                "value": (
-                    "<image>\nLocate the object described by the referring expression: "
-                    f"{json.dumps(example.referring_expression)}. "
-                    'Return JSON {"bbox_2d": [x1, y1, x2, y2]} using XYXY coordinates '
-                    "normalised to 0-1000 relative to the full image."
-                ),
+                "value": "<image>\n" + grounding_prompt(example.referring_expression),
             },
             {
                 "from": "gpt",
@@ -93,12 +89,14 @@ def _training_record(example: AcceptedExample, image_path: str) -> dict:
     }
 
 
-def export_training(store: SupabaseStore, drive: GoogleDrive, run_id: str, output: Path) -> int:
+def export_training(
+    store: SupabaseStore, drive: GoogleDrive, run_ids: list[str], output: Path
+) -> int:
     # An explicit opt-in download for training; generation never writes local files.
     if output.exists() and any(output.iterdir()):
         raise ValueError("Training output directory is not empty; choose another --output.")
     records, downloaded = [], {}
-    for example in store.iter_accepted_examples(run_id):
+    for example in store.iter_accepted_examples(run_ids):
         file_id = validate_file_id(example.image_file_id)
         if file_id not in downloaded:
             content = drive.download(file_id)

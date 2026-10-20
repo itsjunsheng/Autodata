@@ -48,6 +48,9 @@ class MemorySupabase:
             for field, value in request.url.params.items():
                 if value.startswith("eq."):
                     rows = [row for row in rows if str(row[field]) == value[3:]]
+                elif value.startswith("in.("):
+                    allowed = value[4:-1].split(",")
+                    rows = [row for row in rows if str(row[field]) in allowed]
             select = request.url.params.get("select", "")
             if table == "refcoco_annotations":
                 fields = select.split(",")

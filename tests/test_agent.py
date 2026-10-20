@@ -1,17 +1,22 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 from conftest import make_settings
 
+from judge import decide as judge_decide
 from main_agent import MainAgent
 from model_client import ModelError
 from models import (
     Box,
     Candidate,
     ChallengerDirection,
+    Claim,
     Prediction,
     Round,
+    Verdict,
 )
+from outputs import round_status
 from verifier import Verifier, decide
 
 
@@ -26,10 +31,15 @@ class ScriptedRoles:
         self.main_histories = []
         self.directions = []
         self.solve_calls = []
+        self.judge_calls = 0
+        self.verdict = Verdict(
+            claims=[Claim(claim="visible cue", visible=True)], other_matches=0, reason="ok"
+        )
         self.client = SimpleNamespace(complete=self.direct)
         self.challenger = SimpleNamespace(generate=self.generate)
         self.weak_solver = SimpleNamespace(solve=self.solve_weak)
         self.strong_solver = SimpleNamespace(solve=self.solve_strong)
+        self.judge = SimpleNamespace(review=self.review)
         self.verifier = Verifier(settings)
         self.main = MainAgent(
             self.client,
@@ -37,11 +47,12 @@ class ScriptedRoles:
             self.challenger,
             self.weak_solver,
             self.strong_solver,
+            self.judge,
             self.verifier,
         )
 
     def direct(self, **kwargs):
-        history = kwargs["payload"]["previous_attempts"]
+        history = json.loads(kwargs["text"])["previous_attempts"]
         self.main_histories.append(history)
         feedback = history[-1]["feedback"] if history else "Try a visible relation."
         return ChallengerDirection(
@@ -63,6 +74,10 @@ class ScriptedRoles:
     def solve_strong(self, image, referring_expression):
         self.solve_calls.append((referring_expression, "strong"))
         return Prediction(bbox=self.sample.target)
+
+    def review(self, image, sample, referring_expression):
+        self.judge_calls += 1
+        return self.verdict
 
 
 def wrong_box():
@@ -128,7 +143,7 @@ def test_failed_api_call_is_not_a_weak_solver_mistake(sample, image):
     "weak,strong,accepted",
     [(0.5, 1, False), (0, 0.49, False), (0.49, 0.6, False), (0.2, 0.5, True)],
 )
-def test_contrastive_acceptance_boundaries(weak, strong, accepted):
+def test_round_accepted_only_when_all_three_checks_pass(weak, strong, accepted):
     current = Round(
         number=1,
         candidate=Candidate(referring_expression="cup on left", strategy="position"),
@@ -138,15 +153,8 @@ def test_contrastive_acceptance_boundaries(weak, strong, accepted):
     assert decide(current, make_settings())[0] is accepted
 
 
-def test_localisation_mode_is_explicit_and_still_requires_strong_success(sample, image):
-    roles = ScriptedRoles(sample, settings=make_settings(acceptance="localisation"))
-    result = roles.main.run(sample, image, lambda _: None)
-    assert result.status == "accepted"
-    assert result.rounds[0].weak_iou == 1
-
-
-def test_verifier_requires_both_scores_and_keeps_strong_threshold_in_localisation_mode():
-    verifier = Verifier(make_settings(acceptance="localisation"))
+def test_verifier_requires_both_scores_and_reports_a_strong_miss():
+    verifier = Verifier(make_settings())
     with pytest.raises(ValueError, match="Both solvers"):
         verifier.evaluate(Round(number=1, strong_iou=1))
     accepted, feedback = verifier.evaluate(Round(number=1, weak_iou=0, strong_iou=0.49))
@@ -177,3 +185,79 @@ def test_main_agent_cannot_relax_verifier_gates(sample, image):
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "exhausted"
     assert not result.rounds[0].accepted
+
+
+def test_judge_rejection_keeps_rejected_status_and_the_loop_continues(sample, image):
+    roles = ScriptedRoles(sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=2))
+    roles.verdict = Verdict(
+        claims=[Claim(claim="purple apple", visible=False)], other_matches=0, reason="Apple is red."
+    )
+    result = roles.main.run(sample, image, lambda _: None)
+    assert result.status == "exhausted"
+    assert len(result.rounds) == 2
+    first = result.rounds[0]
+    assert first.accepted is False
+    assert first.feedback.startswith("Rejected by judge")
+    assert "purple apple" in first.feedback
+    assert first.judge == roles.verdict
+    assert "Rejected by judge" in roles.main_histories[1][0]["feedback"]
+
+
+def test_judge_pass_appends_its_note_to_the_verifier_feedback(sample, image):
+    roles = ScriptedRoles(sample, [wrong_box()], settings=make_settings(max_rounds=1))
+    result = roles.main.run(sample, image, lambda _: None)
+    assert result.status == "accepted"
+    assert roles.judge_calls == 1
+    assert result.rounds[0].feedback.endswith(
+        "Judge: every claim is visible and no other object matches."
+    )
+
+
+def test_judge_is_not_called_for_a_round_the_verifier_rejects(sample, image):
+    roles = ScriptedRoles(sample, settings=make_settings(max_rounds=1))
+    result = roles.main.run(sample, image, lambda _: None)
+    assert result.status == "exhausted"
+    assert roles.judge_calls == 0
+    assert result.rounds[0].judge is None
+
+
+def test_judge_model_error_is_recorded_as_an_error(sample, image):
+    roles = ScriptedRoles(sample, [wrong_box()])
+
+    def fail(*args):
+        raise ModelError("Judge unavailable")
+
+    roles.judge.review = fail
+    result = roles.main.run(sample, image, lambda _: None)
+    assert result.status == "error"
+    assert "Judge unavailable" in result.error
+    assert round_status(result, result.rounds[0]) == "error"
+
+
+def test_judge_accepts_when_every_claim_is_visible_and_nothing_else_matches():
+    verdict = Verdict(claims=[Claim(claim="red cup", visible=True)], other_matches=0, reason="ok")
+    accepted, feedback = judge_decide(verdict)
+    assert accepted
+    assert feedback.startswith("Judge:")
+
+
+def test_judge_rejects_a_claim_that_is_not_visible_and_names_it():
+    verdict = Verdict(
+        claims=[Claim(claim="red cup", visible=True), Claim(claim="on the shelf", visible=False)],
+        other_matches=0,
+        reason="No shelf.",
+    )
+    accepted, feedback = judge_decide(verdict)
+    assert not accepted
+    assert feedback.startswith("Rejected by judge")
+    assert "on the shelf" in feedback and "red cup" not in feedback
+
+
+def test_judge_rejects_when_other_objects_also_match():
+    verdict = Verdict(
+        claims=[Claim(claim="cup", visible=True)], other_matches=2, reason="Two more."
+    )
+    accepted, feedback = judge_decide(verdict)
+    assert not accepted
+    assert feedback.startswith("Rejected by judge")
+    assert "2 other object(s)" in feedback

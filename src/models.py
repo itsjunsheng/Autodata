@@ -111,6 +111,19 @@ class ChallengerDirection(StrictModel):
     challenger_prompt: Annotated[str, text_limit(1600)]
 
 
+class Claim(StrictModel):
+    claim: Annotated[str, text_limit(200)]
+    visible: bool
+
+
+class Verdict(StrictModel):
+    # The judge's review of one referring expression against the marked target.
+
+    claims: list[Claim]
+    other_matches: int = Field(ge=0)
+    reason: Annotated[str, text_limit(400)]
+
+
 class Prediction(StrictModel):
     bbox: Box
 
@@ -174,6 +187,7 @@ class Round(StrictModel):
     strong: Prediction | None = None
     weak_iou: float | None = None
     strong_iou: float | None = None
+    judge: Verdict | None = None
     accepted: bool = False
     feedback: str = ""
 
@@ -186,23 +200,24 @@ class Result(StrictModel):
 
 
 class Settings(StrictModel):
-    # Model IDs have no defaults in code; `run` reads all four from .env.
+    # Model IDs have no defaults in code; `run` reads all five from .env.
     main_model: str = Field(min_length=1)
     challenger_model: str = Field(min_length=1)
     strong_provider: Literal["openai", "openrouter"] = "openrouter"
     strong_model: str = Field(min_length=1)
     weak_model: str = Field(min_length=1)
-    max_rounds: int = Field(default=3, ge=1, le=20)
+    judge_model: str = Field(min_length=1)
+    max_rounds: int = Field(default=6, ge=1, le=20)
     iou_threshold: float = Field(default=0.5, gt=0, le=1)
     min_iou_gap: float = Field(default=0.2, ge=0, le=1)
-    acceptance: Literal["contrastive", "localisation"] = "contrastive"
-    max_output_tokens: int = Field(default=2000, ge=256)
+    # Reasoning tokens count toward this cap; an exhausted cap is an incomplete response.
+    max_output_tokens: int = Field(default=8000, ge=256)
 
     @classmethod
     def from_env(cls, **overrides: object) -> "Settings":
         models = {}
         missing = []
-        for role in ("main", "challenger", "strong", "weak"):
+        for role in ("main", "challenger", "strong", "weak", "judge"):
             name = f"AUTODATA_{role.upper()}_MODEL"
             value = os.getenv(name, "").strip()
             if value:

@@ -1,5 +1,7 @@
 # The challenger LLM creates examples from the main agent's instructions.
 
+import json
+
 from PIL import Image
 
 from dataset import target_views
@@ -40,12 +42,15 @@ class Challenger:
             role="challenger",
             model=self.model,
             instructions=INSTRUCTIONS,
-            payload={
-                "challenger_prompt": direction.challenger_prompt,
-                "target_bbox_2d": sample.target.as_xyxy(),
-                "source_referring_expressions": sample.referring_expressions,
-                "previous_attempts": [round_.model_dump() for round_ in history],
-            },
+            text=json.dumps(
+                {
+                    "challenger_prompt": direction.challenger_prompt,
+                    "target_bbox_2d": sample.target.as_xyxy(),
+                    "source_referring_expressions": sample.referring_expressions,
+                    "previous_attempts": [round_.model_dump() for round_ in history],
+                },
+                ensure_ascii=False,
+            ),
             images=target_views(image, sample.target),
             schema=Candidate,
         )

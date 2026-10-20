@@ -10,12 +10,13 @@ from PIL import Image
 from pydantic import ValidationError
 
 from challenger import Challenger
+from judge import INSTRUCTIONS as JUDGE_INSTRUCTIONS
+from judge import Judge
 from main_agent import MainAgent
 from model_client import OPENROUTER_BASE_URL, ModelError, OpenAIClient, OpenRouterClient
-from models import Candidate, ChallengerDirection, GroundingAnswer, Settings
-from strong_solver import SOLVER, StrongSolver
+from models import Candidate, ChallengerDirection, GroundingAnswer, Settings, Verdict
+from solver import Solver, grounding_prompt
 from verifier import Verifier
-from weak_solver import WeakSolver
 
 
 def response_body(text, status="completed"):
@@ -92,24 +93,27 @@ def test_real_sdk_requests_keep_labels_and_marked_images_away_from_solvers(image
 
     settings = make_settings()
     client = OpenAIClient(settings, client=mock_client(respond))
-    weak_solver = WeakSolver(
+    weak_solver = Solver(
         OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL)),
         settings.weak_model,
+        "weak_solver",
     )
-    strong_solver = StrongSolver(client, settings.strong_model)
+    strong_solver = Solver(client, settings.strong_model, "strong_solver")
     weak = weak_solver.solve(image, "cup beside the plate")
     strong = strong_solver.solve(image, "cup beside the plate")
     assert weak == strong
     weak_request = requests["openrouter.ai"]
     strong_request = requests["api.openai.com"]
-    assert weak_request["messages"][0]["content"] == strong_request["instructions"] == SOLVER
+    assert "instructions" not in strong_request
+    assert [m["role"] for m in weak_request["messages"]] == ["user"]
+    assert weak_request["temperature"] == 0
     assert strong_request["store"] is False
     assert weak_request["model"] == settings.weak_model
     assert strong_request["model"] == settings.strong_model
-    for content in [weak_request["messages"][1]["content"], strong_request["input"][0]["content"]]:
+    for content in [weak_request["messages"][0]["content"], strong_request["input"][0]["content"]]:
         assert len(content) == 2
-        assert json.loads(content[0]["text"]) == {"referring_expression": "cup beside the plate"}
-        image_url = content[1]["image_url"]
+        assert content[-1]["text"] == grounding_prompt("cup beside the plate")
+        image_url = content[0]["image_url"]
         if isinstance(image_url, dict):
             image_url = image_url["url"]
         raw = base64.b64decode(image_url.split(",")[1])
@@ -121,7 +125,7 @@ def test_real_sdk_requests_keep_labels_and_marked_images_away_from_solvers(image
 def test_openai_rejects_invalid_model_boxes(image, text):
     client = mock_client(lambda _: httpx.Response(200, json=response_body(text)))
     transport = OpenAIClient(make_settings(), client=client)
-    solver = StrongSolver(transport, make_settings().strong_model)
+    solver = Solver(transport, make_settings().strong_model, "strong_solver")
     with pytest.raises(ModelError, match="invalid structured"):
         solver.solve(image, "cup")
 
@@ -133,7 +137,7 @@ def test_openai_refusal_is_not_scored(image):
         make_settings(), client=mock_client(lambda _: httpx.Response(200, json=body))
     )
     with pytest.raises(ModelError, match="refused"):
-        StrongSolver(client, make_settings().strong_model).solve(image, "cup")
+        Solver(client, make_settings().strong_model, "strong_solver").solve(image, "cup")
 
 
 @pytest.mark.parametrize("code", ["rate_limit_exceeded", "insufficient_quota", "slow_down"])
@@ -160,7 +164,7 @@ def test_openai_429_reports_model_code_and_safe_rate_headers(image, code):
 
     transport = OpenAIClient(make_settings(), client=mock_client(respond))
     with pytest.raises(ModelError) as caught:
-        StrongSolver(transport, "gpt-5.6-luna").solve(image, "cup")
+        Solver(transport, "gpt-5.6-luna", "strong_solver").solve(image, "cup")
     message = str(caught.value)
     assert "strong_solver" in message and "model=gpt-5.6-luna" in message
     assert f"code={code}" in message
@@ -188,20 +192,50 @@ def test_openrouter_uses_vision_chat_api_and_json_schema(image, sample):
     settings = make_settings()
     router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
     router.check_model(settings.weak_model, "weak_solver")
-    solver = WeakSolver(router, settings.weak_model)
+    solver = Solver(router, settings.weak_model, "weak_solver")
     prediction = solver.solve(image, "cup on the table")
     assert prediction.bbox == sample.target
     request = requests[0]
-    assert request["messages"][0]["content"] == SOLVER
-    assert json.loads(request["messages"][1]["content"][0]["text"]) == {
-        "referring_expression": "cup on the table"
-    }
+    assert [m["role"] for m in request["messages"]] == ["user"]
+    content = request["messages"][0]["content"]
+    assert content[0]["type"] == "image_url"
+    assert content[-1]["text"] == grounding_prompt("cup on the table")
+    assert request["temperature"] == 0
     assert request["model"] == "qwen/qwen3-vl-8b-instruct"
     assert request["response_format"]["type"] == "json_schema"
     schema = request["response_format"]["json_schema"]
     assert schema["strict"] is True
     assert schema["schema"]["properties"]["bbox_2d"]
     assert request["provider"] == {"require_parameters": True}
+
+
+def test_judge_sends_both_images_and_parses_a_verdict(image, sample):
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        reply = {
+            "claims": [{"claim": "red cup", "visible": True}],
+            "other_matches": 1,
+            "reason": "A second red cup.",
+        }
+        return httpx.Response(200, json=chat_body(json.dumps(reply)))
+
+    settings = make_settings()
+    router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
+    verdict = Judge(router, settings.judge_model).review(image, sample, "the red cup")
+    assert verdict == Verdict(
+        claims=[{"claim": "red cup", "visible": True}],
+        other_matches=1,
+        reason="A second red cup.",
+    )
+    request = requests[0]
+    assert request["model"] == settings.judge_model
+    assert request["messages"][0] == {"role": "system", "content": JUDGE_INSTRUCTIONS}
+    content = request["messages"][1]["content"]
+    assert [part["type"] for part in content] == ["image_url", "image_url", "text"]
+    assert "the red cup" in content[-1]["text"] and "target_bbox_2d" in content[-1]["text"]
+    assert request["response_format"]["json_schema"]["name"] == "Verdict"
 
 
 def test_qwen_credentials_are_separate(monkeypatch):
@@ -243,8 +277,10 @@ def test_openrouter_api_failure_is_not_a_weak_solver_failure(image):
         OPENROUTER_BASE_URL,
     )
     with pytest.raises(ModelError, match="credits"):
-        WeakSolver(
-            OpenRouterClient(make_settings(), client=client), make_settings().weak_model
+        Solver(
+            OpenRouterClient(make_settings(), client=client),
+            make_settings().weak_model,
+            "weak_solver",
         ).solve(image, "cup")
 
 
@@ -265,6 +301,11 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
                 "strategy": "relation",
             },
             "GroundingAnswer": {"bbox_2d": [100, 200, 500, 800]},
+            "Verdict": {
+                "claims": [{"claim": "cup beside the plate", "visible": True}],
+                "other_matches": 0,
+                "reason": "Only one cup.",
+            },
         }
         return httpx.Response(200, json=response_body(json.dumps(outputs[schema])))
 
@@ -272,9 +313,10 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
         return httpx.Response(200, json=chat_body('{"bbox_2d":[700,100,900,300]}'))
 
     settings = make_settings()
-    weak = WeakSolver(
+    weak = Solver(
         OpenRouterClient(settings, client=mock_client(qwen_response, OPENROUTER_BASE_URL)),
         settings.weak_model,
+        "weak_solver",
     )
     client = OpenAIClient(settings, client=mock_client(openai_response))
     main_agent = MainAgent(
@@ -282,14 +324,18 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
         settings,
         Challenger(client, settings.challenger_model),
         weak,
-        StrongSolver(client, settings.strong_model),
+        Solver(client, settings.strong_model, "strong_solver"),
+        Judge(client, settings.judge_model),
         Verifier(settings),
     )
     result = main_agent.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert len(result.rounds) == 1
-    assert [len(r["input"][0]["content"]) for r in openai_requests] == [3, 3, 2]
-    challenger_input = json.loads(openai_requests[1]["input"][0]["content"][0]["text"])
+    assert [len(r["input"][0]["content"]) for r in openai_requests] == [3, 3, 2, 3]
+    challenger_input = json.loads(openai_requests[1]["input"][0]["content"][-1]["text"])
+    for request in openai_requests[:2]:
+        assert request["instructions"]
+        assert "temperature" not in request
     assert challenger_input["challenger_prompt"] == result.rounds[0].direction.challenger_prompt
     assert list(tmp_path.iterdir()) == []
 
@@ -301,12 +347,13 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
 def test_qwen_invalid_or_truncated_answer_is_an_error(image, finish, content):
     body = chat_body(content, finish)
     settings = make_settings()
-    solver = WeakSolver(
+    solver = Solver(
         OpenRouterClient(
             settings,
             client=mock_client(lambda _: httpx.Response(200, json=body), OPENROUTER_BASE_URL),
         ),
         settings.weak_model,
+        "weak_solver",
     )
     with pytest.raises(ModelError):
         solver.solve(image, "cup")
@@ -322,14 +369,13 @@ def test_strong_solver_on_openrouter_uses_chat_api_with_strong_model(image, samp
 
     settings = make_settings(strong_provider="openrouter")
     router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
-    prediction = StrongSolver(router, settings.strong_model).solve(image, "cup")
+    prediction = Solver(router, settings.strong_model, "strong_solver").solve(image, "cup")
     assert prediction.bbox == sample.target
     request = requests[0]
     assert request["model"] == "qwen/qwen3-vl-235b-a22b-instruct"
-    assert request["messages"][0]["content"] == SOLVER
-    assert json.loads(request["messages"][1]["content"][0]["text"]) == {
-        "referring_expression": "cup"
-    }
+    assert [m["role"] for m in request["messages"]] == ["user"]
+    assert request["messages"][0]["content"][-1]["text"] == grounding_prompt("cup")
+    assert request["temperature"] == 0
 
 
 def test_openai_preflight_rejects_openrouter_model_id_before_generation():
@@ -419,7 +465,7 @@ def schema_keywords(node):
             yield from schema_keywords(item)
 
 
-@pytest.mark.parametrize("schema", [GroundingAnswer, Candidate, ChallengerDirection])
+@pytest.mark.parametrize("schema", [GroundingAnswer, Candidate, ChallengerDirection, Verdict])
 def test_response_schemas_use_only_openai_strict_keywords(schema):
     unsupported = set(schema_keywords(schema.model_json_schema())) - STRICT_SCHEMA_KEYWORDS
     assert unsupported == set()
@@ -448,6 +494,7 @@ def test_model_ids_come_from_env_with_no_defaults(monkeypatch):
         "AUTODATA_CHALLENGER_MODEL",
         "AUTODATA_STRONG_MODEL",
         "AUTODATA_WEAK_MODEL",
+        "AUTODATA_JUDGE_MODEL",
     ]
     for name in names:
         monkeypatch.delenv(name, raising=False)

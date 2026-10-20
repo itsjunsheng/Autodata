@@ -1,4 +1,4 @@
-# Deterministic bounding-box IoU scoring and acceptance decisions. No model calls.
+# Deterministic bounding-box IoU scoring and the three accept checks. No model calls.
 
 from models import Box, Prediction, Round, Settings
 
@@ -16,11 +16,9 @@ def iou(first: Box, second: Box) -> float:
 def decide(current: Round, settings: Settings) -> tuple[bool, str]:
     # Compare measured scores with fixed thresholds; never judge the referring expression.
     if current.strong_iou is None or current.weak_iou is None:
-        raise ValueError("Both solvers must be evaluated before acceptance.")
+        raise ValueError("Both solvers must be evaluated before a decision.")
     if current.strong_iou < settings.iou_threshold:
         return False, "Strong solver missed the target. Clarify visible distinguishing details."
-    if settings.acceptance == "localisation":
-        return True, "Strong-solver IoU passed the localisation threshold."
     if current.weak_iou >= settings.iou_threshold:
         return False, "Too easy for the weak solver. Try a different meaningful visible relation."
     if current.strong_iou - current.weak_iou < settings.min_iou_gap:

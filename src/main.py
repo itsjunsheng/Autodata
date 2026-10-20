@@ -21,11 +21,12 @@ from google_drive import (
     authenticate_drive,
     create_drive_client,
 )
+from judge import Judge
 from main_agent import MainAgent
 from model_client import ModelClient, ModelError, OpenAIClient, OpenRouterClient
 from models import Result, Sample, Settings
 from outputs import export_training, render_round_preview, round_status
-from strong_solver import StrongSolver
+from solver import Solver
 from supabase_client import (
     SupabaseError,
     SupabaseStore,
@@ -33,7 +34,8 @@ from supabase_client import (
     create_supabase_client,
 )
 from verifier import Verifier
-from weak_solver import WeakSolver
+
+MAX_CONSECUTIVE_ERRORS = 3
 
 
 def run_batch(
@@ -46,7 +48,7 @@ def run_batch(
     # Process one target at a time, downloading each distinct image once.
     # Checkpoint partial rounds and final previews.
     counts = Counter()
-    processed = rounds = 0
+    processed = rounds = consecutive_errors = 0
     previous_file_id = None
     image = None
     print(f"Supabase run ID: {store.run_id}", flush=True)
@@ -96,10 +98,21 @@ def run_batch(
             counts[result.status] += 1
             print(f"  {result.status} after {len(result.rounds)} round(s)", flush=True)
             if result.status == "error":
-                print(f"  Stopping batch: {result.error}", flush=True)
-                break
-        store.finish("error" if counts["error"] else "completed")
+                print(f"  Recorded error: {result.error}", flush=True)
+                consecutive_errors += 1
+                if consecutive_errors == MAX_CONSECUTIVE_ERRORS:
+                    print(
+                        f"  Stopping batch: {MAX_CONSECUTIVE_ERRORS} targets in a row failed. "
+                        "Check the provider and rerun.",
+                        flush=True,
+                    )
+                    break
+            else:
+                consecutive_errors = 0
+        status = "completed" if processed == requested else "error"
+        store.finish(status)
         return {
+            "status": status,
             "requested": requested,
             "processed": processed,
             "unprocessed": requested - processed,
@@ -126,6 +139,7 @@ def role_models(
         "challenger": (openai_client, settings.challenger_model),
         "strong_solver": (strong_clients[settings.strong_provider], settings.strong_model),
         "weak_solver": (openrouter, settings.weak_model),
+        "judge": (openrouter, settings.judge_model),
     }
 
 
@@ -154,19 +168,21 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--offset", type=nonnegative_int, default=0, help="Skip this many database targets."
     )
-    run.add_argument("--max-rounds", type=positive_int, default=3)
-    run.add_argument("--iou-threshold", type=float, default=0.5)
-    run.add_argument("--min-iou-gap", type=float, default=0.2)
-    run.add_argument("--acceptance", choices=["contrastive", "localisation"], default="contrastive")
     run.add_argument(
         "--dry-run",
         action="store_true",
         help="Check cloud images/boxes without model calls or outputs.",
     )
     export = commands.add_parser(
-        "export", help="Download one run's accepted examples as Qwen training data."
+        "export", help="Download runs' accepted examples as Qwen training data."
     )
-    export.add_argument("--run-id", type=UUID, required=True)
+    export.add_argument(
+        "--run-id",
+        type=UUID,
+        required=True,
+        nargs="+",
+        help="One or more run IDs whose accepted rounds to export together.",
+    )
     export.add_argument(
         "--output", type=Path, required=True, help="Directory for the local Qwen training bundle."
     )
@@ -199,15 +215,12 @@ def main(argv: list[str] | None = None) -> int:
         drive.check_connection()
         store = SupabaseStore(client)
         if args.command == "export":
-            count = export_training(store, drive, str(args.run_id), args.output)
+            count = export_training(
+                store, drive, [str(run_id) for run_id in args.run_id], args.output
+            )
             print(f"Downloaded {count} accepted examples to {args.output}")
             return 0
-        settings = Settings.from_env(
-            max_rounds=args.max_rounds,
-            iou_threshold=args.iou_threshold,
-            min_iou_gap=args.min_iou_gap,
-            acceptance=args.acceptance,
-        )
+        settings = Settings.from_env()
         available = store.annotation_count() - args.offset
         if available < args.limit:
             raise ValueError(
@@ -230,17 +243,18 @@ def main(argv: list[str] | None = None) -> int:
             client=openai_client,
             settings=settings,
             challenger=Challenger(openai_client, settings.challenger_model),
-            weak_solver=WeakSolver(*roles["weak_solver"]),
-            strong_solver=StrongSolver(*roles["strong_solver"]),
+            weak_solver=Solver(*roles["weak_solver"], role="weak_solver"),
+            strong_solver=Solver(*roles["strong_solver"], role="strong_solver"),
+            judge=Judge(*roles["judge"]),
             verifier=Verifier(settings),
         )
         print(f"Strong solver: {settings.strong_provider} / {settings.strong_model}")
         print(f"Weak solver: openrouter / {settings.weak_model}")
-        print(f"Maximum {args.limit * settings.max_rounds * 4} model calls, excluding retries.")
+        print(f"Maximum {args.limit * settings.max_rounds * 5} model calls, excluding retries.")
         summary = run_batch(samples, args.limit, agent, store, drive)
         print(json.dumps(summary, indent=2))
         print(f"Accepted examples: rounds with status 'accepted' for run {summary['run_id']}")
-        return 1 if summary["errors"] else 0
+        return 0 if summary["status"] == "completed" else 1
     except (
         OSError,
         ValueError,

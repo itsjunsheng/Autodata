@@ -15,8 +15,9 @@ from dataset import DatasetError
 from google_drive import DriveError
 from main import main, role_models, run_batch
 from model_client import ModelError
-from models import Prediction
+from models import Claim, Prediction, Verdict
 from outputs import export_training
+from solver import grounding_prompt
 from supabase_client import SupabaseError, SupabaseStore
 
 
@@ -64,7 +65,7 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     row = next(iter(memory.tables["rounds"].values()))
     assert row["strong_bbox_2d"][0] == 110
     assert row["status"] == "accepted"
-    example = next(store.iter_accepted_examples(store.run_id))
+    example = next(store.iter_accepted_examples([store.run_id]))
     assert example.bbox_2d == [100, 200, 500, 800]
     assert example.image_file_id == sample.image_file_id
     assert example.referring_expression == row["referring_expression"]
@@ -91,8 +92,11 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
         "previews",
     }
     training_dir = tmp_path / "training"
-    assert export_training(store, cloud.drive, store.run_id, training_dir) == 1
+    assert export_training(store, cloud.drive, [store.run_id], training_dir) == 1
     training = json.loads((training_dir / "qwen_train.json").read_text())
+    assert training[0]["conversations"][0]["value"] == "<image>\n" + grounding_prompt(
+        row["referring_expression"]
+    )
     assert training[0]["conversations"][1]["value"] == '{"bbox_2d": [100, 200, 500, 800]}'
     assert (training_dir / training[0]["images"][0]).read_bytes() == image_bytes
 
@@ -130,7 +134,7 @@ def test_previews_are_named_by_ref_id_and_do_not_overwrite_shared_images(
     assert len(downloads) == 1
 
 
-def test_zero_acceptance_keeps_rounds_rejected_and_export_empty(
+def test_no_accepted_round_keeps_rounds_rejected_and_export_empty(
     sample_record, sample, image_bytes, tmp_path
 ):
     memory, cloud, store = cloud_for(sample_record, image_bytes)
@@ -141,13 +145,30 @@ def test_zero_acceptance_keeps_rounds_rejected_and_export_empty(
     assert "accepted_file_id" not in summary
     assert next(iter(memory.tables["rounds"].values()))["status"] == "rejected"
     with pytest.raises(ValueError, match="No accepted"):
-        export_training(store, cloud.drive, store.run_id, tmp_path / "training")
+        export_training(store, cloud.drive, [store.run_id], tmp_path / "training")
     assert list(tmp_path.iterdir()) == []
 
 
-def test_model_failure_keeps_partial_round_and_previous_acceptance(
+def test_judge_rejecting_every_round_saves_rejected_rows_and_exhausts(
     sample_record, sample, image_bytes
 ):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    roles = ScriptedRoles(sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=2))
+    roles.verdict = Verdict(
+        claims=[Claim(claim="purple apple", visible=False)], other_matches=0, reason="Red apple."
+    )
+    summary = run_batch(store.iter_samples(1), 1, roles.main, store, cloud.drive)
+    assert summary["exhausted"] == 1
+    saved = list(memory.tables["rounds"].values())
+    assert len(saved) == 2
+    assert all(row["status"] == "rejected" for row in saved)
+    assert all(row["feedback"].startswith("Rejected by judge") for row in saved)
+    assert accepted_rounds(memory) == []
+    run_row = next(iter(memory.tables["runs"].values()))
+    assert run_row["judge_model"] == make_settings().judge_model
+
+
+def test_model_failure_is_recorded_and_the_batch_continues(sample_record, sample, image_bytes):
     memory, cloud, store = cloud_for(sample_record, image_bytes)
     second = sample_record.model_copy(
         update={
@@ -159,24 +180,44 @@ def test_model_failure_keeps_partial_round_and_previous_acceptance(
     roles = ScriptedRoles(sample, [wrong_box()], settings=make_settings(max_rounds=1))
     generate = roles.challenger.generate
 
-    def fail_on_second(image, target, direction, history):
-        if target.ref_id == 2:
+    def fail_on_first(image, target, direction, history):
+        if target.ref_id == 1:
             raise ModelError("Challenger unavailable")
         return generate(image, target, direction, history)
 
-    roles.challenger.generate = fail_on_second
+    roles.challenger.generate = fail_on_first
     summary = run_batch(store.iter_samples(2), 2, roles.main, store, cloud.drive)
-    assert summary["accepted"] == summary["errors"] == 1
+    assert summary["errors"] == summary["accepted"] == 1
+    assert summary["status"] == "completed"
     saved = list(memory.tables["rounds"].values())
-    assert [row["status"] for row in saved] == ["accepted", "error"]
-    assert saved[-1]["referring_expression"] is None
-    assert saved[-1]["weak_bbox_2d"] is None
-    assert saved[-1]["feedback"] == "Challenger unavailable"
-    assert saved[-1]["preview_file_id"]
-    assert memory.tables["runs"][store.run_id]["status"] == "error"
+    assert [row["status"] for row in saved] == ["error", "accepted"]
+    assert saved[0]["referring_expression"] is None
+    assert saved[0]["weak_bbox_2d"] is None
+    assert saved[0]["feedback"] == "Challenger unavailable"
+    assert saved[0]["preview_file_id"]
+    assert memory.tables["runs"][store.run_id]["status"] == "completed"
     assert len(accepted_rounds(memory)) == 1
     downloads = [uri for method, uri in cloud.requests if method == "GET" and "alt=media" in uri]
     assert len(downloads) == 1
+
+
+def test_three_consecutive_failed_targets_stop_the_batch(sample_record, sample, image_bytes):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    for ref_id in (2, 3, 4):
+        memory.seed(sample_record.model_copy(update={"ref_id": ref_id}))
+    roles = ScriptedRoles(sample, settings=make_settings(max_rounds=1))
+
+    def always_fail(image, target, direction, history):
+        raise ModelError("Challenger unavailable")
+
+    roles.challenger.generate = always_fail
+    summary = run_batch(store.iter_samples(4), 4, roles.main, store, cloud.drive)
+    assert summary["processed"] == summary["errors"] == 3
+    assert summary["unprocessed"] == 1
+    assert summary["status"] == "error"
+    assert memory.tables["runs"][store.run_id]["status"] == "error"
+    saved = list(memory.tables["rounds"].values())
+    assert [row["status"] for row in saved] == ["error"] * 3
 
 
 @pytest.mark.parametrize("failure", ["image", "database"])
@@ -244,14 +285,16 @@ def test_export_reads_only_the_runs_accepted_rounds_joined_to_their_annotation(
     roles = ScriptedRoles(sample, [wrong_box()])
     run_batch(second_store.iter_samples(1), 1, roles.main, second_store, cloud.drive)
     assert len(accepted_rounds(memory)) == 2
-    first = list(first_store.iter_accepted_examples(first_store.run_id))
+    first = list(first_store.iter_accepted_examples([first_store.run_id]))
     assert len(first) == 1
     assert first[0].image_file_id == sample.image_file_id
     assert first[0].bbox_2d == [100, 200, 500, 800]
     assert (first[0].width, first[0].height) == (sample.width, sample.height)
-    other = list(second_store.iter_accepted_examples(second_store.run_id))
+    other = list(second_store.iter_accepted_examples([second_store.run_id]))
     assert len(other) == 1
-    assert list(SupabaseStore(memory.client).iter_accepted_examples(str(UUID(int=99)))) == []
+    assert list(SupabaseStore(memory.client).iter_accepted_examples([str(UUID(int=99))])) == []
+    both = list(first_store.iter_accepted_examples([first_store.run_id, second_store.run_id]))
+    assert len(both) == 2
 
 
 def test_import_command_does_not_initialise_model_providers(
@@ -273,7 +316,7 @@ def test_import_command_does_not_initialise_model_providers(
 
     monkeypatch.setattr("main.OpenAIClient", unexpected)
     monkeypatch.setattr("main.OpenRouterClient", unexpected)
-    monkeypatch.setattr("main.WeakSolver", unexpected)
+    monkeypatch.setattr("main.Solver", unexpected)
     assert dataset.main(["--count", "1"]) == 0
     assert memory.tables["runs"] == memory.tables["rounds"] == {}
     assert list(tmp_path.iterdir()) == []
@@ -328,7 +371,7 @@ def test_local_training_export_paginates_and_downloads_original_once(
     memory, cloud, store = cloud_for(sample_record, image_bytes)
     for index in range(103):
         add_accepted_round(memory, store, sample_record, index + 1, f"the cup, example {index}")
-    assert export_training(store, cloud.drive, store.run_id, tmp_path / "training") == 103
+    assert export_training(store, cloud.drive, [store.run_id], tmp_path / "training") == 103
     downloads = [uri for method, uri in cloud.requests if method == "GET" and "alt=media" in uri]
     assert len(downloads) == 1
 
@@ -340,7 +383,7 @@ def test_training_export_rejects_bad_ids_before_any_file_write(
     memory.tables["refcoco_annotations"][sample_record.ref_id]["image_file_id"] = "../outside"
     add_accepted_round(memory, store, sample_record, 1, "the cup")
     with pytest.raises(DriveError):
-        export_training(store, cloud.drive, store.run_id, tmp_path / "training")
+        export_training(store, cloud.drive, [store.run_id], tmp_path / "training")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -349,9 +392,10 @@ def test_role_models_routes_strong_solver_by_provider(provider):
     openai_client, openrouter = object(), object()
     settings = make_settings(strong_provider=provider)
     roles = role_models(settings, openai_client, openrouter)
-    assert list(roles) == ["main_agent", "challenger", "strong_solver", "weak_solver"]
+    assert list(roles) == ["main_agent", "challenger", "strong_solver", "weak_solver", "judge"]
     strong_client = openrouter if provider == "openrouter" else openai_client
     assert roles["strong_solver"] == (strong_client, settings.strong_model)
     assert roles["main_agent"] == (openai_client, settings.main_model)
     assert roles["challenger"] == (openai_client, settings.challenger_model)
     assert roles["weak_solver"] == (openrouter, settings.weak_model)
+    assert roles["judge"] == (openrouter, settings.judge_model)

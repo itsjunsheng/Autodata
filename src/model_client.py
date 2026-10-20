@@ -1,13 +1,12 @@
 # OpenAI and OpenRouter vision requests, pre-flight model checks, and error handling.
 
 import base64
-import json
 import os
 import re
 from io import BytesIO
 from typing import Protocol, TypeVar
 
-from openai import APIError, NotFoundError, OpenAI
+from openai import NOT_GIVEN, APIError, NotFoundError, OpenAI
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 
@@ -77,8 +76,8 @@ class ModelClient(Protocol):
         *,
         role: str,
         model: str,
-        instructions: str,
-        payload: dict,
+        instructions: str | None,
+        text: str,
         images: list[Image.Image],
         schema: type[T],
     ) -> T: ...
@@ -118,22 +117,25 @@ class OpenAIClient:
         *,
         role: str,
         model: str,
-        instructions: str,
-        payload: dict,
+        instructions: str | None,
+        text: str,
         images: list[Image.Image],
         schema: type[T],
     ) -> T:
-        content = [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]
-        content.extend(
+        content = [
             {"type": "input_image", "image_url": data_url(image), "detail": "high"}
             for image in images
-        )
+        ]
+        content.append({"type": "input_text", "text": text})
         try:
             response = self.client.responses.parse(
                 model=model,
-                instructions=instructions,
+                instructions=instructions or NOT_GIVEN,
                 input=[{"role": "user", "content": content}],
                 text_format=schema,
+                # Low effort: reasoning tokens bill as output, and these roles need a brief
+                # diagnosis, not a long deliberation.
+                reasoning={"effort": "low"},
                 max_output_tokens=self.settings.max_output_tokens,
                 store=False,
             )
@@ -200,20 +202,23 @@ class OpenRouterClient:
         *,
         role: str,
         model: str,
-        instructions: str,
-        payload: dict,
+        instructions: str | None,
+        text: str,
         images: list[Image.Image],
         schema: type[T],
     ) -> T:
-        content = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
-        content.extend({"type": "image_url", "image_url": {"url": data_url(i)}} for i in images)
+        content = [{"type": "image_url", "image_url": {"url": data_url(i)}} for i in images]
+        content.append({"type": "text", "text": text})
+        messages = [{"role": "user", "content": content}]
+        if instructions is not None:
+            messages.insert(0, {"role": "system", "content": instructions})
         try:
             response = self.client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": instructions},
-                    {"role": "user", "content": content},
-                ],
+                messages=messages,
+                # Greedy decoding: one solver rollout is reproducible and matches greedy
+                # evaluation of the fine-tuned model.
+                temperature=0,
                 max_tokens=self.settings.max_output_tokens,
                 response_format={
                     "type": "json_schema",

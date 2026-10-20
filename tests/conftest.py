@@ -10,6 +10,7 @@ TEST_MODELS = {
     "challenger_model": "gpt-5.6-luna",
     "strong_model": "qwen/qwen3-vl-235b-a22b-instruct",
     "weak_model": "qwen/qwen3-vl-8b-instruct",
+    "judge_model": "qwen/qwen3-vl-235b-a22b-instruct",
 }
 
 

@@ -1,4 +1,4 @@
--- One row per `run` command: the models, acceptance thresholds, and execution status.
+-- One row per `run` command: the models, IoU thresholds, and execution status.
 -- Run after 00_normalized_bbox.sql.
 begin;
 
@@ -8,7 +8,7 @@ create table public.runs (
     challenger_model text not null,
     weak_model text not null,
     strong_model text not null,
-    acceptance text not null check (acceptance in ('contrastive', 'localisation')),
+    judge_model text not null,
     iou_threshold double precision not null check (iou_threshold > 0 and iou_threshold <= 1),
     min_iou_gap double precision not null check (min_iou_gap between 0 and 1),
     max_rounds integer not null check (max_rounds between 1 and 20),

@@ -44,13 +44,16 @@ Create `.env` from [.env.example](.env.example) and configure your own services:
 | `GOOGLE_DRIVE_CLIENT_FILE` | OAuth client JSON; default `credentials/google_client.json` |
 | `GOOGLE_DRIVE_TOKEN_FILE` | Saved login token; default `credentials/google_token.json` |
 
-The four model settings are required and have no defaults in code. `AUTODATA_MAIN_MODEL`
+The five model settings are required and have no defaults in code. `AUTODATA_MAIN_MODEL`
 and `AUTODATA_CHALLENGER_MODEL` name OpenAI models for the main agent and the challenger.
 `AUTODATA_STRONG_MODEL` names the strong solver, an OpenRouter model unless
 `AUTODATA_STRONG_PROVIDER=openai` is set. `AUTODATA_WEAK_MODEL` names the Qwen weak
-solver on OpenRouter, the checkpoint you intend to fine-tune. `run` stops with a message
+solver on OpenRouter, the checkpoint you intend to fine-tune. `AUTODATA_JUDGE_MODEL` names the OpenRouter
+vision model that reviews passing expressions for truth and uniqueness; use a family other
+than the challenger's. `run` stops with a message
 naming any missing variable, and before any paid call it checks that each provider
-offers the configured model ID.
+offers the configured model ID. Main-agent and challenger calls run at low reasoning
+effort with an 8,000-token output cap; solver calls use greedy decoding.
 Keep `.env` and OAuth credentials private.
 
 ### Supabase
@@ -58,7 +61,7 @@ Keep `.env` and OAuth credentials private.
 | Table | Stores |
 | --- | --- |
 | `refcoco_annotations` | One row per annotated object: `ref_id` (primary key), COCO image ID, category, image size, ground-truth box, the human referring expressions, and the Drive file ID of its image |
-| `runs` | One row per `run` command: models, acceptance thresholds, and status |
+| `runs` | One row per `run` command: models, IoU thresholds, and status |
 | `rounds` | One row per loop round, keyed by run, `ref_id`, and round number: the generated referring expression, both solver boxes, IoUs, and the outcome. Rows with status `accepted` are the training examples |
 
 The schema is one SQL file per table in [supabase/](supabase/), plus the shared coordinate
@@ -119,26 +122,25 @@ After an interrupted import, rerun the same command.
 ### Generate referring expressions
 
 ```powershell
-python src/main.py run --limit 10 --max-rounds 3
+python src/main.py run --limit 10
 ```
 
-Each target gets up to three rounds and stops when accepted. The command prints
+Each target gets up to six rounds and stops when accepted. The command prints
 the run ID and links to round previews. Targets are processed in import order.
 Every run starts a new experiment; it does not resume an earlier run.
-Model errors stop the batch while preserving saved rounds.
+A model error marks that target's round `error` with the message in `feedback`, and
+the batch continues with the next target. After three consecutive failed targets the
+batch stops and the run status is `error`.
 
 | Option | Purpose |
 | --- | --- |
 | `--limit N` | Number of imported targets to process |
-| `--max-rounds N` | Maximum rounds per target |
 | `--offset N` | Skip N targets in import order |
-| `--iou-threshold FLOAT` | Solver success threshold; default `0.5` |
-| `--min-iou-gap FLOAT` | Required strong–weak IoU gap; default `0.2` |
-| `--acceptance localisation` | Accept using strong-solver success alone |
 | `--dry-run` | Validate cloud inputs without model calls or output writes |
 
 Keep the imported set unchanged when using offsets across batches. A full round
-uses four model calls: up to 120 calls for 10 targets and three rounds, excluding retries.
+uses up to five model calls, the fifth only when the three checks pass: up to 300 calls for
+10 targets and six rounds, excluding retries.
 
 ### Export training data
 
@@ -146,8 +148,9 @@ uses four model calls: up to 120 calls for 10 targets and three rounds, excludin
 python src/main.py export --run-id YOUR_RUN_UUID --output training/my_experiment
 ```
 
-Replace `YOUR_RUN_UUID` with a run ID. The destination must be new or empty.
-Export reads the run's accepted rounds joined to their annotations, downloads each
+Replace `YOUR_RUN_UUID` with one or more run IDs; accepted rounds from all of them go
+into one bundle. The destination must be new or empty.
+Export reads the accepted rounds joined to their annotations, downloads each
 referenced original image once into `images/` under the output directory, and writes
 ShareGPT training examples to `qwen_train.json`, with a dataset registry in
 `dataset_info.json`.
@@ -162,21 +165,28 @@ For LLaMA-Factory, set `dataset_dir: training/my_experiment` and
 | Challenger | Generates one referring expression per round |
 | Weak solver | Predicts a box using Qwen through OpenRouter |
 | Strong solver | Predicts a box using Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM |
-| Verifier | Calculates IoU against ground truth and applies acceptance rules |
+| Verifier | Calculates IoU against ground truth and applies the three accept checks |
+| Judge | Sees the marked target; rejects a passing expression whose claims are not visible or that fits another object |
 
 The main agent and challenger see the target annotation. Both solvers receive only
 the clean image and generated referring expression. Rejection feedback informs the
 next round; accepted training labels always use the original ground-truth box.
+Both solvers receive exactly the user prompt written into the training file, with no
+system turn and greedy decoding, so the weak solver is measured on the input it will be
+trained and evaluated on. That prompt is `grounding_prompt` in `solver.py`; use it for
+evaluation too.
 
-Default **contrastive** acceptance requires all three conditions:
+A round is accepted only when all three conditions hold:
 
 - Strong-solver IoU ≥ `0.5`.
 - Weak-solver IoU < `0.5`.
 - Strong-solver IoU − weak-solver IoU ≥ `0.2`.
 
-The **localisation** mode checks only the strong-solver threshold, while still
-running both solvers. The verifier is deterministic and does not judge expression
-ambiguity or truthfulness.
+The threshold, the gap and the round limit are defaults on `Settings` in `models.py`.
+
+The verifier is deterministic. A round that passes it then goes to the judge, a model call
+that checks every stated claim is visible on the target and that no other object fits; its
+rejections keep status `rejected` with feedback starting `Rejected by judge`.
 
 Boxes use **XYXY coordinates normalised to 0–1000**; IoU scores range from **0–1**.
 Training export rounds ground-truth box edges outward to integers.
@@ -206,7 +216,8 @@ across workers. Drive access follows the folder's sharing permissions.
 ## Development
 
 Agent roles each have a module in `src/`: `main_agent.py`, `challenger.py`,
-`weak_solver.py`, `strong_solver.py`, and `verifier.py`.
+`solver.py` (one class, used for both the weak and the strong solver), `judge.py`, and
+`verifier.py`.
 
 | Supporting module | Responsibility |
 | --- | --- |

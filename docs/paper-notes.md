@@ -18,9 +18,9 @@ Read source: all 28 pages of `Autodata.pdf`, including Figures 1–6, experiment
 
 **Related work and discussion (pages 13–15):** the distinguishing feature is adapting creation based on measured usefulness, not just static synthetic generation and filtering. The authors discuss reward hacking, examples that are difficult for unhelpful reasons, dataset-level analysis, and human co-research. In particular, making a weak model intentionally behave poorly is not a legitimate difficulty signal.
 
-**Appendix C (pages 21–28):** the role prompts require actual solver evaluation before acceptance, bounded improvement loops, diagnostic feedback, and incremental persistence. The CS prompt explicitly distinguishes infrastructure failures from poor examples. The scientific-reasoning prompt uses repeated solver outcomes, not a guess that a task will separate models.
+**Appendix C (pages 21–28):** the role prompts require actual solver evaluation before a candidate is accepted, bounded improvement loops, diagnostic feedback, and incremental persistence. The CS prompt explicitly distinguishes infrastructure failures from poor examples. The scientific-reasoning prompt uses repeated solver outcomes, not a guess that a task will separate models.
 
-The paper's settings vary by experiment: Section 3.1, the meta-optimisation setup, and the appendix do not all use the same numeric acceptance conditions. The evolved CS prompt also differs from the earlier rubric prompts on negative weights. We therefore define and document a separate, fixed localisation policy instead of claiming one universal paper threshold.
+The paper's settings vary by experiment: Section 3.1, the meta-optimisation setup, and the appendix do not all use the same numeric accept conditions. The evolved CS prompt also differs from the earlier rubric prompts on negative weights. We therefore define and document a separate, fixed three-check rule for this task instead of claiming one universal paper threshold.
 
 ## Mapping to this implementation
 
@@ -29,9 +29,9 @@ The paper's settings vary by experiment: Section 3.1, the meta-optimisation setu
 | Grounding source | Original RefCOCO train image, target annotation, source referring expressions |
 | Main agent | OpenAI LLM creates the challenger prompt, analyses previous outcomes, and revises the strategy (`main_agent.py`) |
 | Challenger | OpenAI VLM creates a referring expression from the main agent's prompt (`challenger.py`) |
-| Referring-expression checks | No semantic review or duplicate filter after generation; candidates go directly to both solvers |
-| Weak solver | The target Qwen3-VL model called through OpenRouter (`weak_solver.py`) |
-| Strong solver | Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM; correctness measured per candidate (`strong_solver.py`) |
+| Referring-expression checks | Candidates go directly to both solvers; a VLM judge (`judge.py`) then reviews each round that passes the three IoU checks for visible truth of every claim and for other matching objects |
+| Weak solver | The target Qwen3-VL model called through OpenRouter (`solver.py`) |
+| Strong solver | Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM; correctness measured per candidate (`solver.py`) |
 | Objective evaluator | Python IoU against the unchanged RefCOCO annotation |
 | Verifier implementation | Deterministic IoU calculation and threshold comparison, with no model calls (`verifier.py`) |
 | Execution harness | Python enforces label boundaries, fixed gates, and bounded rounds around the main LLM |
@@ -39,27 +39,27 @@ The paper's settings vary by experiment: Section 3.1, the meta-optimisation setu
 | Final data | Original image, accepted generated referring expression, annotated box in Qwen3-VL format |
 | Trajectories | Supabase stores one row per round, with accepted rounds forming the training set; Google Drive stores one coloured image per completed/failed round |
 
-The implementation imports every referred object of each image and uses one candidate per round, one rollout per solver, at most three rounds, and at most one accepted example per input sample. Each of the five diagram roles has its own module. Four roles make model calls; the verifier is deterministic Python. The main agent performs actual LLM planning/reflection; a small Python harness enforces the workflow and acceptance gates. There is no agent framework, code execution tool, or autonomous edit to scoring code. This is the inner data-creation loop, not the paper's outer meta-optimisation procedure.
+The implementation imports every referred object of each image and uses one candidate per round, one rollout per solver, at most six rounds, and at most one accepted example per input sample. Each diagram role has a module; the two solvers share one class. Five roles make model calls; the verifier is deterministic Python. The main agent performs actual LLM planning/reflection; a small Python harness enforces the workflow and the verifier's gates. There is no agent framework, code execution tool, or autonomous edit to scoring code. This is the inner data-creation loop, not the paper's outer meta-optimisation procedure.
 
 ## Quality boundaries
 
-- The answer is fixed before generation. The main agent and challenger cannot change the ground-truth box or acceptance thresholds.
-- Annotated images and target metadata go only to the main agent and challenger; the deterministic verifier receives ground-truth and predicted boxes. Solvers see clean images and referring expressions in fresh requests, without main-agent instructions.
+- The answer is fixed before generation. The main agent and challenger cannot change the ground-truth box or the verifier thresholds.
+- Annotated images and target metadata go only to the main agent and challenger; the deterministic verifier receives ground-truth and predicted boxes. Solvers see clean images and referring expressions in fresh requests, without main-agent instructions, with no system turn, and in the same user prompt as the training file.
 - Both solvers receive the same task and coordinate convention. Qwen is never instructed to be weak.
-- Every generated referring expression is sent to the solvers, including duplicates. There is no semantic quality veto.
-- Solver agreement or a high IoU does not establish referring expression truthfulness or uniqueness.
+- Every generated referring expression is sent to the solvers, including duplicates. The judge runs only after the three checks pass, never before the solvers.
+- Solver agreement or a high IoU does not establish referring expression truthfulness or uniqueness; the judge checks both on passing rounds and is itself a model judgment with its own error rate.
 - Provider failures, refusals, truncation, and invalid coordinates produce an error, not a successful weak-failure criterion.
 - The final answer comes from RefCOCO, not a potentially imprecise model prediction.
 - Rejected/exhausted targets remain inspectable and are excluded from the training bundle.
 - Generation uses training samples only; the source adapter enforces training-only without a stored split attribute. The ten examples are a workflow pilot, not an evaluation benchmark.
 
-## Initial acceptance policy
+## Accept rule
 
-The default contrastive policy requires strong IoU ≥ 0.5, weak IoU < 0.5, and an IoU gap ≥ 0.2. This is an initial binary-localisation adaptation of the paper's weak/strong setup. It cannot establish GRPO suitability from one rollout, and it does not guarantee better supervised training. The optional localisation policy accepts strong-solver success without requiring a weak-solver failure. Neither policy independently verifies semantic quality.
+A round is accepted only when strong IoU ≥ 0.5, weak IoU < 0.5, and the IoU gap is ≥ 0.2. This is an initial binary-localisation adaptation of the paper's weak/strong setup. It cannot establish GRPO suitability from one rollout, and it does not guarantee better supervised training. The judge adds a semantic check on passing rounds; it does not make the rule's thresholds any less fixed.
 
 Strong/weak names are roles, not measured model rankings. A general OpenAI VLM may underperform Qwen on precise box placement. Such cases should be diagnosed in traces and addressed through solver selection or an improved localisation harness; the code does not silently relax correctness.
 
-This is an intentional simplification of the paper's verifier/judge: generated referring expressions are retained through solver comprehension and deterministic geometry, rather than an additional VLM quality judgment. Historical runs used the earlier quality gate; their records are not reevaluated automatically.
+This is an intentional simplification of the paper's verifier/judge: generated referring expressions are retained through solver comprehension and deterministic geometry, with a VLM judge reviewing only the rounds that pass. Historical runs used the earlier quality gate; their records are not reevaluated automatically.
 
 ## Later experiments
 
