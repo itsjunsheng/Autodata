@@ -100,23 +100,34 @@ def source_row(ref_id=10, image_id=20):
         "ref_id": ref_id,
         "image_id": image_id,
         "ann_id": ann_id,
+        "category_id": 47,
         "split": "train",
         "sentences": [{"sent": "the red cup"}],
         "bbox": [20, 20, 100, 80],
-        "raw_anns": json.dumps({"id": ann_id, "image_id": image_id, "bbox": [20, 20, 80, 60]}),
+        "raw_anns": json.dumps(
+            {
+                "id": ann_id,
+                "image_id": image_id,
+                "category_id": 47,
+                "bbox": [20, 20, 80, 60],
+                "area": 4800,
+                "iscrowd": 0,
+            }
+        ),
         "raw_image_info": json.dumps({"id": image_id, "width": 200, "height": 100}),
     }
 
 
 @pytest.mark.parametrize(
-    "count,expected_images,expected_offsets",
-    [(2, [20, 21], [0, 2]), (3, [20, 21, 19], [0, 2])],
+    "count,expected_refs,expected_offsets",
+    [(2, [10, 11, 12], [0, 2]), (3, [10, 11, 12, 13, 14], [0, 2, 4])],
 )
-def test_import_selection_uses_first_distinct_images_in_source_order(
-    count, expected_images, expected_offsets, monkeypatch
+def test_import_selection_keeps_every_object_of_the_first_images(
+    count, expected_refs, expected_offsets, monkeypatch
 ):
     monkeypatch.setattr("dataset.ROW_PAGE_SIZE", 2)
-    rows = [source_row(10 + index, image_id) for index, image_id in enumerate([20, 20, 21, 19, 21])]
+    images = [20, 20, 21, 19, 19]
+    rows = [source_row(10 + index, image_id) for index, image_id in enumerate(images)]
     offsets = []
 
     def respond(request):
@@ -133,9 +144,22 @@ def test_import_selection_uses_first_distinct_images_in_source_order(
 
     with HTTPClient(transport=httpx.MockTransport(respond)) as client:
         references = list(iter_references(client, count))
-    assert [reference.image_id for reference in references] == expected_images
-    assert [reference.ref_id for reference in references] == [10, 12, 13][:count]
+    assert [reference.ref_id for reference in references] == expected_refs
+    assert [reference.image_id for reference in references] == images[: len(expected_refs)]
     assert offsets == expected_offsets
+
+
+def test_import_rejects_non_adjacent_rows_for_one_image():
+    rows = [source_row(10, 20), source_row(11, 21), source_row(12, 20)]
+
+    def respond(request):
+        return httpx.Response(
+            200, json={"num_rows_total": len(rows), "rows": [{"row": row} for row in rows]}
+        )
+
+    with HTTPClient(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(DatasetError, match="not adjacent"):
+            list(iter_references(client, 2))
 
 
 def test_import_reports_when_too_few_distinct_images_are_available():
@@ -171,7 +195,7 @@ def test_source_pagination_accepts_a_short_final_page():
 
     with HTTPClient(transport=httpx.MockTransport(respond)) as client:
         references = list(iter_references(client, 3))
-    assert [reference.image_id for reference in references] == [20, 21, 22]
+    assert [reference.image_id for reference in references] == [20] * 100 + [21, 22]
     assert offsets == [0, 100]
 
 
@@ -261,8 +285,28 @@ def test_mirror_adapter_reads_raw_coco_annotation():
     assert reference.target.as_xyxy() == [100, 200, 500, 800]
     assert reference.referring_expressions == ["the red cup"]
     assert reference.image_url.endswith("000000000020.jpg")
+    assert reference.category == "cup"
+    record = reference.sample_record("file-id")
+    assert (record.coco_image_id, record.ref_id, record.category) == (20, 10, "cup")
     row["image_id"] = 99
     with pytest.raises(ValueError, match="IDs disagree"):
+        reference_from_row(row)
+
+
+def test_unknown_category_is_rejected():
+    row = source_row()
+    row["category_id"] = 12
+    annotation = json.loads(row["raw_anns"])
+    annotation["category_id"] = 12
+    row["raw_anns"] = json.dumps(annotation)
+    with pytest.raises(ValueError, match="Unknown COCO category"):
+        reference_from_row(row)
+
+
+def test_category_must_match_the_row_category():
+    row = source_row()
+    row["category_id"] = 1
+    with pytest.raises(ValueError, match="category IDs disagree"):
         reference_from_row(row)
 
 
@@ -280,10 +324,12 @@ def test_image_dimensions_checked_in_memory(image_bytes):
         load_image(image_bytes, 999, 100)
 
 
-def dataset_transport(monkeypatch, image, *, bad_dimensions=False, partial=False, downloads=None):
-    row = source_row()
+def dataset_transport(
+    monkeypatch, image, *, rows=None, bad_dimensions=False, partial=False, downloads=None
+):
+    rows = rows or [source_row()]
     if bad_dimensions:
-        row["raw_image_info"] = json.dumps({"id": 20, "width": 999, "height": 100})
+        rows[0]["raw_image_info"] = json.dumps({"id": 20, "width": 999, "height": 100})
     buffer = BytesIO()
     image.save(buffer, format="JPEG")
 
@@ -295,8 +341,8 @@ def dataset_transport(monkeypatch, image, *, bad_dimensions=False, partial=False
             return httpx.Response(
                 200,
                 json={
-                    "num_rows_total": 1,
-                    "rows": [{"row": row}],
+                    "num_rows_total": len(rows),
+                    "rows": [{"row": row} for row in rows],
                     "partial": partial,
                 },
             )
@@ -322,18 +368,46 @@ def test_import_goes_directly_to_cloud_and_reuses_originals(image, tmp_path, mon
         assert report["skipped"] == index
     assert len(downloads) == 1
     assert list(tmp_path.iterdir()) == []
-    assert len(memory.tables["samples"]) == 1
-    assert memory.tables["runs"] == memory.tables["attempts"] == {}
-    record = next(iter(memory.tables["samples"].values()))
+    assert len(memory.tables["refcoco_annotations"]) == 1
+    assert memory.tables["runs"] == memory.tables["rounds"] == {}
+    record = next(iter(memory.tables["refcoco_annotations"].values()))
     assert record["bbox_2d"] == [100, 200, 500, 800]
     assert record["referring_expressions"] == ["the red cup"]
-    assert "split" not in record
     assert {
         row["name"] for row in cloud.objects.values() if row.get("parents") == ["root-folder"]
-    } == {"samples"}
+    } == {"images", "previews"}
     assert cloud.contents[record["image_file_id"]] == original
-    assert cloud.objects[record["image_file_id"]]["name"] == "sample 1.jpg"
+    assert cloud.objects[record["image_file_id"]]["name"] == "20.jpg"
     assert sum(method == "PUT" for method, _ in cloud.requests) == 1
+
+
+def test_import_keeps_every_object_of_an_image_and_uploads_it_once(image, monkeypatch):
+    memory, cloud = MemorySupabase(), MemoryDrive()
+    second = source_row(11, 20)
+    second["sentences"] = [{"sent": "the blue cup"}, {"sent": "cup on the right"}]
+    second["raw_anns"] = json.dumps(
+        {"id": 31, "image_id": 20, "category_id": 47, "bbox": [120, 10, 60, 60]}
+    )
+    downloads = []
+    dataset_transport(monkeypatch, image, rows=[source_row(10, 20), second], downloads=downloads)
+    report = import_refcoco(cloud.drive, SupabaseStore(memory.client), count=1)
+    assert report["sample_rows"] == 2 and report["unique_images"] == 1
+    assert report["downloaded"] == 1 and report["skipped"] == 0
+    assert len(downloads) == 1
+    assert sum(method == "PUT" for method, _ in cloud.requests) == 1
+    samples = list(memory.tables["refcoco_annotations"].values())
+    assert len(samples) == 2 and len({row["image_file_id"] for row in samples}) == 1
+    assert [row["referring_expressions"] for row in samples] == [
+        ["the red cup"],
+        ["the blue cup", "cup on the right"],
+    ]
+    assert samples[1]["bbox_2d"] == [600, 100, 900, 700]
+    dataset_transport(monkeypatch, image, rows=[source_row(10, 20), second], downloads=downloads)
+    report = import_refcoco(
+        GoogleDrive(cloud.service, "root-folder"), SupabaseStore(memory.client), count=1
+    )
+    assert report["skipped"] == 2 and report["downloaded"] == 0
+    assert len(downloads) == 1 and len(memory.tables["refcoco_annotations"]) == 2
 
 
 def test_bad_image_never_creates_an_uploaded_image_or_grounding_row(image, monkeypatch):
@@ -342,7 +416,7 @@ def test_bad_image_never_creates_an_uploaded_image_or_grounding_row(image, monke
     with pytest.raises(ValueError, match="dimensions"):
         import_refcoco(cloud.drive, SupabaseStore(memory.client), 1)
     assert cloud.contents == {}
-    assert memory.tables["samples"] == {}
+    assert memory.tables["refcoco_annotations"] == {}
 
 
 def test_partial_source_annotation_never_creates_a_record(image, monkeypatch):
@@ -351,23 +425,23 @@ def test_partial_source_annotation_never_creates_a_record(image, monkeypatch):
     with pytest.raises(DatasetError, match="complete rows"):
         import_refcoco(cloud.drive, SupabaseStore(memory.client), 1)
     assert cloud.contents == {}
-    assert memory.tables["samples"] == {}
+    assert memory.tables["refcoco_annotations"] == {}
 
 
 def test_failed_database_import_can_be_repeated_without_uploading_again(image, monkeypatch):
     memory, cloud = MemorySupabase(), MemoryDrive()
-    memory.fail_sample_write = True
+    memory.fail_annotation_write = True
     downloads = []
     dataset_transport(monkeypatch, image, downloads=downloads)
     with pytest.raises(SupabaseError):
         import_refcoco(cloud.drive, SupabaseStore(memory.client), 1)
-    assert memory.tables["samples"] == {}
-    memory.fail_sample_write = False
+    assert memory.tables["refcoco_annotations"] == {}
+    memory.fail_annotation_write = False
     dataset_transport(monkeypatch, image, downloads=downloads)
     report = import_refcoco(
         GoogleDrive(cloud.service, "root-folder"), SupabaseStore(memory.client), 1
     )
-    assert len(memory.tables["samples"]) == 1
+    assert len(memory.tables["refcoco_annotations"]) == 1
     assert report["downloaded"] == 0
     assert len(downloads) == 1
     assert sum(method == "PUT" for method, _ in cloud.requests) == 1
@@ -406,18 +480,18 @@ def test_source_failure_keeps_saved_samples_and_rerun_completes_without_duplicat
     )
     with pytest.raises(DatasetError, match="COCO image 21 for reference 11: HTTP 404"):
         import_refcoco(cloud.drive, SupabaseStore(memory.client), 2)
-    assert len(memory.tables["samples"]) == len(cloud.contents) == 1
+    assert len(memory.tables["refcoco_annotations"]) == len(cloud.contents) == 1
     missing_second = False
     another_client = GoogleDrive(cloud.service, "root-folder")
     report = import_refcoco(another_client, SupabaseStore(memory.client), 2)
     assert report["sample_rows"] == report["unique_images"] == 2
-    assert len(memory.tables["samples"]) == len(cloud.contents) == 2
+    assert len(memory.tables["refcoco_annotations"]) == len(cloud.contents) == 2
     assert report["skipped"] == report["downloaded"] == 1
     assert downloads == [20, 21, 21]
     assert sum(method == "PUT" for method, _ in cloud.requests) == 2
     assert {cloud.objects[file_id]["name"] for file_id in cloud.contents} == {
-        "sample 1.jpg",
-        "sample 2.jpg",
+        "20.jpg",
+        "21.jpg",
     }
 
 
@@ -427,7 +501,7 @@ def test_import_repairs_missing_images_without_overwriting_labels(image, monkeyp
     downloads = []
     dataset_transport(monkeypatch, image, downloads=downloads)
     import_refcoco(cloud.drive, SupabaseStore(memory.client), 1)
-    row = next(iter(memory.tables["samples"].values()))
+    row = next(iter(memory.tables["refcoco_annotations"].values()))
     old_file_id = row["image_file_id"]
     row["bbox_2d"] = [90, 180, 540, 850]
     row["referring_expressions"] = ["a manually edited expression"]
@@ -443,30 +517,46 @@ def test_import_repairs_missing_images_without_overwriting_labels(image, monkeyp
     )
     assert report["downloaded"] == 1 and report["skipped"] == 0
     assert len(downloads) == 2
-    assert len(memory.tables["samples"]) == 1
+    assert len(memory.tables["refcoco_annotations"]) == 1
     assert row["image_file_id"] != old_file_id
     assert row == {**labels, "image_file_id": row["image_file_id"]}
-    assert cloud.drive.image_exists(row["image_file_id"])
+    assert cloud.drive.find_image("20.jpg") == row["image_file_id"]
+
+
+def test_row_with_dead_file_id_is_relinked_to_the_image_found_by_name(image, monkeypatch):
+    memory, cloud = MemorySupabase(), MemoryDrive()
+    original = dataset_transport(monkeypatch, image)
+    file_id = cloud.drive.upload_image("20.jpg", original, "image/jpeg")
+    source = reference_from_row(source_row())
+    memory.seed(source.sample_record("dead-file-id"))
+    downloads = []
+    dataset_transport(monkeypatch, image, downloads=downloads)
+    report = import_refcoco(
+        GoogleDrive(cloud.service, "root-folder"), SupabaseStore(memory.client), 1
+    )
+    row = next(iter(memory.tables["refcoco_annotations"].values()))
+    assert report["downloaded"] == 0 and report["skipped"] == 0
+    assert row["image_file_id"] == file_id
+    assert downloads == []
 
 
 def test_drive_permission_error_stops_before_an_image_download(image, monkeypatch):
     memory, cloud = MemorySupabase(), MemoryDrive()
     dataset_transport(monkeypatch, image)
     import_refcoco(cloud.drive, SupabaseStore(memory.client), 1)
-    file_id = next(iter(memory.tables["samples"].values()))["image_file_id"]
-    cloud.file_errors[file_id] = 403
+    cloud.list_error = 403
     downloads = []
     dataset_transport(monkeypatch, image, downloads=downloads)
     with pytest.raises(DriveError, match="HTTP 403"):
         import_refcoco(GoogleDrive(cloud.service, "root-folder"), SupabaseStore(memory.client), 1)
     assert downloads == []
-    assert len(cloud.contents) == len(memory.tables["samples"]) == 1
+    assert len(cloud.contents) == len(memory.tables["refcoco_annotations"]) == 1
 
 
-def test_older_saved_sample_is_skipped_without_a_source_identifier(image, monkeypatch):
+def test_older_saved_sample_is_skipped_without_downloading(image, monkeypatch):
     memory, cloud = MemorySupabase(), MemoryDrive()
     original = dataset_transport(monkeypatch, image)
-    file_id = cloud.drive.upload("samples/sample 1.jpg", original, "image/jpeg", immutable=True)
+    file_id = cloud.drive.upload_image("20.jpg", original, "image/jpeg")
     source = reference_from_row(source_row())
     memory.seed(source.sample_record(file_id))
     downloads = []
@@ -476,5 +566,4 @@ def test_older_saved_sample_is_skipped_without_a_source_identifier(image, monkey
     )
     assert report["skipped"] == 1 and report["downloaded"] == 0
     assert downloads == []
-    assert "properties" not in cloud.objects[file_id]
     assert all(request.method == "GET" for request in memory.requests)

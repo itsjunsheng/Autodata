@@ -6,10 +6,15 @@ image, a referring expression, and a ground-truth bounding box for Qwen3-VL trai
 
 The design follows the Autodata paper; see [paper notes](docs/paper-notes.md).
 
+Three commands make up the workflow. `python src/dataset.py` imports RefCOCO images into
+Drive and their annotations into Supabase. `python src/main.py run` generates and tests
+referring expressions for those annotations. `python src/main.py export` writes the
+accepted ones as a Qwen training set.
+
 ## Getting started
 
 Requires Python 3.11+, OpenAI and OpenRouter API access, a Supabase project,
-and a Google Drive folder.
+and a Google Drive folder with two subfolders, `images` and `previews`.
 
 ### Python environment
 
@@ -39,19 +44,26 @@ Create `.env` from [.env.example](.env.example) and configure your own services:
 | `GOOGLE_DRIVE_CLIENT_FILE` | OAuth client JSON; default `credentials/google_client.json` |
 | `GOOGLE_DRIVE_TOKEN_FILE` | Saved login token; default `credentials/google_token.json` |
 
-Model settings are `AUTODATA_MAIN_MODEL`, `AUTODATA_CHALLENGER_MODEL`,
-`AUTODATA_STRONG_MODEL`, and `AUTODATA_WEAK_MODEL`. The OpenAI roles default to
-`gpt-5.4-nano`; the Qwen weak solver defaults to `qwen/qwen3-vl-8b-instruct` on OpenRouter.
+The four model settings are required and have no defaults in code. `AUTODATA_MAIN_MODEL`
+and `AUTODATA_CHALLENGER_MODEL` name OpenAI models for the main agent and the challenger.
+`AUTODATA_STRONG_MODEL` names the strong solver, an OpenRouter model unless
+`AUTODATA_STRONG_PROVIDER=openai` is set. `AUTODATA_WEAK_MODEL` names the Qwen weak
+solver on OpenRouter, the checkpoint you intend to fine-tune. `run` stops with a message
+naming any missing variable, and before any paid call it checks that each provider
+offers the configured model ID.
 Keep `.env` and OAuth credentials private.
 
 ### Supabase
 
 | Table | Stores |
 | --- | --- |
-| `samples` | Image metadata, ground-truth boxes, and source referring expressions |
-| `runs` | Models, acceptance thresholds, and execution status |
-| `attempts` | Generated referring expressions, predictions, IoUs, and outcomes |
-| `outputs` | Accepted examples, linked to their attempt through `attempt_id` |
+| `refcoco_annotations` | One row per annotated object: `ref_id` (primary key), COCO image ID, category, image size, ground-truth box, the human referring expressions, and the Drive file ID of its image |
+| `runs` | One row per `run` command: models, acceptance thresholds, and status |
+| `rounds` | One row per loop round, keyed by run, `ref_id`, and round number: the generated referring expression, both solver boxes, IoUs, and the outcome. Rows with status `accepted` are the training examples |
+
+The schema is one SQL file per table in [supabase/](supabase/), plus the shared coordinate
+type. In the Supabase SQL editor run them in numeric order, `00_normalized_bbox.sql` through
+`03_rounds.sql`, on an empty project. Then check the result:
 
 ```powershell
 python src/main.py supabase-check
@@ -63,7 +75,9 @@ python src/main.py supabase-check
 2. Configure the OAuth consent screen and create a **Desktop app** OAuth client.
    Add your account as a test user if the app is in testing mode.
 3. Save the downloaded client JSON to `credentials/google_client.json`.
-4. Set `GOOGLE_DRIVE_FOLDER_ID` to your folder's ID, then sign in:
+4. Create two folders named `images` and `previews` inside the project folder. The
+   code never creates folders; it only looks these two up.
+5. Set `GOOGLE_DRIVE_FOLDER_ID` to the project folder's ID, then sign in and check:
 
 ```powershell
 python src/main.py drive-auth
@@ -77,27 +91,30 @@ for OAuth setup details.
 
 ## Usage
 
-### Import samples
+### Import annotations
 
 ```powershell
-python src/main.py import-dataset --count 10
+python src/dataset.py --count 10
 ```
 
-The importer selects the first 10 distinct training images from
-[jxu124/refcoco](https://huggingface.co/datasets/jxu124/refcoco), with one annotated
-target per image. It reads annotations from Hugging Face and downloads the original
-COCO images. Images go into Drive; metadata goes into Supabase `samples`.
+The importer takes the first 10 images of the
+[jxu124/refcoco](https://huggingface.co/datasets/jxu124/refcoco) training split in source
+order and imports every annotated object in them, each with its human referring
+expressions. It reads annotations from Hugging Face and downloads the original COCO
+images. Each image goes into the Drive `images/` folder under its COCO image ID; each
+object becomes one row in `refcoco_annotations` pointing at that file.
 
 To expand to 100 images:
 
 ```powershell
-python src/main.py import-dataset --count 100
+python src/dataset.py --count 100
 ```
 
-`--count` is the total selection size. Repeating an import checks Supabase and Drive
-before downloading, skips complete samples, and repairs missing images or metadata.
-After an interrupted import, rerun the same command. Selection always follows source
-order and rescans annotations from the beginning.
+`--count` is the number of images; each contributes all of its annotated objects, about
+2.5 on average. There is no offset: selection always starts from the first image, so a
+larger count adds to what is already imported. Rerunning the same command skips objects
+that are already complete, repairs a missing image or row, and never duplicates either.
+After an interrupted import, rerun the same command.
 
 ### Generate referring expressions
 
@@ -105,23 +122,22 @@ order and rescans annotations from the beginning.
 python src/main.py run --limit 10 --max-rounds 3
 ```
 
-Each target gets up to three attempts and stops when accepted. The command prints
-the run ID and links to attempt images. Targets are processed in import order.
+Each target gets up to three rounds and stops when accepted. The command prints
+the run ID and links to round previews. Targets are processed in import order.
 Every run starts a new experiment; it does not resume an earlier run.
-Model errors stop the batch while preserving saved attempts.
+Model errors stop the batch while preserving saved rounds.
 
 | Option | Purpose |
 | --- | --- |
 | `--limit N` | Number of imported targets to process |
-| `--max-rounds N` | Maximum attempts per target |
+| `--max-rounds N` | Maximum rounds per target |
 | `--offset N` | Skip N targets in import order |
-| `--dataset NAME` | Filter targets by source dataset |
 | `--iou-threshold FLOAT` | Solver success threshold; default `0.5` |
 | `--min-iou-gap FLOAT` | Required strong–weak IoU gap; default `0.2` |
 | `--acceptance localisation` | Accept using strong-solver success alone |
 | `--dry-run` | Validate cloud inputs without model calls or output writes |
 
-Keep the sample set unchanged when using offsets across batches. A full attempt
+Keep the imported set unchanged when using offsets across batches. A full round
 uses four model calls: up to 120 calls for 10 targets and three rounds, excluding retries.
 
 ### Export training data
@@ -131,8 +147,10 @@ python src/main.py export --run-id YOUR_RUN_UUID --output training/my_experiment
 ```
 
 Replace `YOUR_RUN_UUID` with a run ID. The destination must be new or empty.
-Export downloads accepted clean images into `images/` and creates ShareGPT training
-examples in `qwen_train.json`, with a dataset registry in `dataset_info.json`.
+Export reads the run's accepted rounds joined to their annotations, downloads each
+referenced original image once into `images/` under the output directory, and writes
+ShareGPT training examples to `qwen_train.json`, with a dataset registry in
+`dataset_info.json`.
 For LLaMA-Factory, set `dataset_dir: training/my_experiment` and
 `dataset: autodata_grounding`.
 
@@ -141,14 +159,14 @@ For LLaMA-Factory, set `dataset_dir: training/my_experiment` and
 | Role | Responsibility |
 | --- | --- |
 | Main agent | Plans generation and revises instructions from previous results |
-| Challenger | Generates one referring expression per attempt |
+| Challenger | Generates one referring expression per round |
 | Weak solver | Predicts a box using Qwen through OpenRouter |
-| Strong solver | Predicts a box using the configured OpenAI VLM |
+| Strong solver | Predicts a box using Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM |
 | Verifier | Calculates IoU against ground truth and applies acceptance rules |
 
 The main agent and challenger see the target annotation. Both solvers receive only
 the clean image and generated referring expression. Rejection feedback informs the
-next attempt; accepted training labels always use the original ground-truth box.
+next round; accepted training labels always use the original ground-truth box.
 
 Default **contrastive** acceptance requires all three conditions:
 
@@ -165,20 +183,21 @@ Training export rounds ground-truth box edges outward to integers.
 
 ## Storage
 
-Supabase stores metadata and accepted examples. Google Drive stores images in two
-top-level folders, created automatically:
+Supabase stores annotations, runs and rounds. Google Drive stores images in the two
+folders you created inside the project folder:
 
 ```text
 Drive root/
-  samples/sample 1.jpg
-  samples/sample 2.jpg
-  attempts/<run-id>/sample 1 attempt 1.png
-  attempts/<run-id>/sample 1 attempt 2.png
+  images/581857.jpg
+  previews/<run id> ref 0 round 1.png
 ```
 
-Attempt images show the referring expression, outcome, and boxes: **green** for
+`images/` holds one original per COCO image, named by its COCO image ID. `previews/`
+holds one PNG per loop round, named by run ID, RefCOCO ref ID and round number.
+
+Round previews show the referring expression, outcome, and boxes: **green** for
 ground truth, **red** for the weak solver, and **blue** for the strong solver.
-Training uses clean sample images. Import and generation store their results in
+Training uses the clean original images. Import and generation store their results in
 the cloud; `export` explicitly creates local training files.
 
 Run one importing or generating process at a time; file creation is not coordinated
@@ -191,13 +210,13 @@ Agent roles each have a module in `src/`: `main_agent.py`, `challenger.py`,
 
 | Supporting module | Responsibility |
 | --- | --- |
-| `main.py` | CLI and workflow coordination |
-| `dataset.py` | RefCOCO import and image validation |
+| `main.py` | CLI for Drive and Supabase checks, the agent loop, and export |
+| `dataset.py` | RefCOCO import script (`python src/dataset.py`), category lookup, and image validation |
 | `models.py` | Data structures, settings, and coordinate conversion |
-| `model_client.py` | OpenAI requests and provider errors |
+| `model_client.py` | OpenAI and OpenRouter requests, model pre-flight checks, and provider errors |
 | `google_drive.py` | Google authentication and image storage |
-| `supabase_client.py` | Database access and attempt persistence |
-| `outputs.py` | Attempt images and training export |
+| `supabase_client.py` | Database access and round persistence |
+| `outputs.py` | Round previews and training export |
 
 ```powershell
 python -m pip install -e ".[dev]"
@@ -207,4 +226,4 @@ python -m ruff format --check src tests
 ```
 
 Tests use mocked HTTP services and make no paid model calls. The database schema
-is in [supabase/setup.sql](supabase/setup.sql).
+is in [supabase/](supabase/), one file per table plus the shared box type.

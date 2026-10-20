@@ -1,20 +1,28 @@
 # Read RefCOCO annotations and import clean images directly into cloud storage.
 
+import argparse
 import json
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
-from uuid import NAMESPACE_URL, UUID, uuid5
+from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 
-from google_drive import GoogleDrive
-from models import Box, SampleRecord, from_coco_xywh
-from supabase_client import SupabaseStore
+from google_drive import DriveError, GoogleDrive, create_drive_client
+from models import AnnotationRecord, Box, from_coco_xywh
+from supabase_client import (
+    SupabaseError,
+    SupabaseStore,
+    check_supabase_connection,
+    create_supabase_client,
+)
 
 DATASET = "jxu124/refcoco"
 ROWS_URL = "https://datasets-server.huggingface.co/rows"
@@ -24,6 +32,88 @@ ROW_PAGE_SIZE = 100
 MAX_REQUEST_ATTEMPTS = 4
 MAX_RETRY_DELAY = 60
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+COCO_CATEGORIES: dict[int, str] = {
+    1: "person",
+    2: "bicycle",
+    3: "car",
+    4: "motorcycle",
+    5: "airplane",
+    6: "bus",
+    7: "train",
+    8: "truck",
+    9: "boat",
+    10: "traffic light",
+    11: "fire hydrant",
+    13: "stop sign",
+    14: "parking meter",
+    15: "bench",
+    16: "bird",
+    17: "cat",
+    18: "dog",
+    19: "horse",
+    20: "sheep",
+    21: "cow",
+    22: "elephant",
+    23: "bear",
+    24: "zebra",
+    25: "giraffe",
+    27: "backpack",
+    28: "umbrella",
+    31: "handbag",
+    32: "tie",
+    33: "suitcase",
+    34: "frisbee",
+    35: "skis",
+    36: "snowboard",
+    37: "sports ball",
+    38: "kite",
+    39: "baseball bat",
+    40: "baseball glove",
+    41: "skateboard",
+    42: "surfboard",
+    43: "tennis racket",
+    44: "bottle",
+    46: "wine glass",
+    47: "cup",
+    48: "fork",
+    49: "knife",
+    50: "spoon",
+    51: "bowl",
+    52: "banana",
+    53: "apple",
+    54: "sandwich",
+    55: "orange",
+    56: "broccoli",
+    57: "carrot",
+    58: "hot dog",
+    59: "pizza",
+    60: "donut",
+    61: "cake",
+    62: "chair",
+    63: "couch",
+    64: "potted plant",
+    65: "bed",
+    67: "dining table",
+    70: "toilet",
+    72: "tv",
+    73: "laptop",
+    74: "mouse",
+    75: "remote",
+    76: "keyboard",
+    77: "cell phone",
+    78: "microwave",
+    79: "oven",
+    80: "toaster",
+    81: "sink",
+    82: "refrigerator",
+    84: "book",
+    85: "clock",
+    86: "vase",
+    87: "scissors",
+    88: "teddy bear",
+    89: "hair drier",
+    90: "toothbrush",
+}
 
 
 class DatasetError(RuntimeError):
@@ -107,32 +197,31 @@ class RefCOCOReference:
 
     ref_id: int
     image_id: int
+    category: str
     width: int
     height: int
     target: Box
     referring_expressions: list[str]
 
     @property
-    def sample_id(self) -> UUID:
-        return uuid5(NAMESPACE_URL, f"{DATASET}:ref:{self.ref_id}")
-
-    @property
-    def image_key(self) -> str:
-        return f"coco:train2014:{self.image_id}"
+    def file_name(self) -> str:
+        # Drive name: the bare COCO image ID, which is the coco_image_id column.
+        return f"{self.image_id}.jpg"
 
     @property
     def image_url(self) -> str:
         return f"{IMAGE_BASE}/COCO_train2014_{self.image_id:012d}.jpg"
 
-    def sample_record(self, file_id: str) -> SampleRecord:
-        return SampleRecord(
-            id=self.sample_id,
+    def sample_record(self, file_id: str) -> AnnotationRecord:
+        return AnnotationRecord(
             image_file_id=file_id,
             width=self.width,
             height=self.height,
             bbox_2d=self.target.as_xyxy(),
             referring_expressions=self.referring_expressions,
-            dataset=DATASET,
+            coco_image_id=self.image_id,
+            ref_id=self.ref_id,
+            category=self.category,
         )
 
 
@@ -146,12 +235,18 @@ def reference_from_row(row: dict) -> RefCOCOReference:
         raise ValueError("Expected a single-object RefCOCO annotation.")
     if row["split"] != "train":
         raise ValueError("Refusing to import evaluation references into the training pool.")
+    category_id = annotation["category_id"]
+    if category_id != row["category_id"]:
+        raise ValueError("RefCOCO category IDs disagree.")
+    if category_id not in COCO_CATEGORIES:
+        raise ValueError(f"Unknown COCO category ID {category_id}.")
     expressions = [sentence["sent"].strip() for sentence in row["sentences"]]
     if not expressions or any(not expression for expression in expressions):
         raise ValueError("RefCOCO reference has an empty referring expression.")
     return RefCOCOReference(
         ref_id=row["ref_id"],
         image_id=row["image_id"],
+        category=COCO_CATEGORIES[category_id],
         width=info["width"],
         height=info["height"],
         target=from_coco_xywh(annotation["bbox"], info["width"], info["height"]),
@@ -182,7 +277,7 @@ def fetch_rows(client: httpx.Client, offset: int) -> dict:
 
 
 def iter_references(client: httpx.Client, count: int) -> Iterator[RefCOCOReference]:
-    # Read the first distinct images in source order, with one target per image.
+    # Read every referred object of the first `count` images, in source order.
     if count < 1:
         raise ValueError("count must be positive")
     first = fetch_rows(client, 0)
@@ -190,65 +285,120 @@ def iter_references(client: httpx.Client, count: int) -> Iterator[RefCOCOReferen
     if count > total:
         raise ValueError(f"Only {total} references are available.")
     seen = set()
+    current = None
     for offset in range(0, total, ROW_PAGE_SIZE):
         payload = first if offset == 0 else fetch_rows(client, offset)
         if payload["num_rows_total"] != total:
             raise DatasetError("The source row count changed during import. Rerun later.")
         for item in payload["rows"]:
             reference = reference_from_row(item["row"])
-            if reference.image_id in seen:
-                continue
-            seen.add(reference.image_id)
+            if reference.image_id != current:
+                # Rows of one image are adjacent: a new image ID completes the previous one.
+                if reference.image_id in seen:
+                    raise DatasetError(
+                        "RefCOCO rows for one image are not adjacent. Check the source."
+                    )
+                if len(seen) == count:
+                    return
+                seen.add(reference.image_id)
+                current = reference.image_id
             yield reference
-            if len(seen) == count:
-                return
-    raise ValueError("Not enough distinct images in this split.")
+    if len(seen) < count:
+        raise ValueError("Not enough distinct images in this split.")
 
 
 def import_refcoco(drive: GoogleDrive, store: SupabaseStore, count: int) -> dict:
-    # Skip complete samples and fill missing images or metadata on a rerun.
-    image_ids = set()
-    processed = skipped = downloaded = 0
+    # Import every referred object of the first `count` images. Drive is checked by file name
+    # first, then the row is created, repaired or skipped.
+    images: dict[int, str] = {}  # COCO image ID -> Drive file ID, shared by its objects
+    objects = skipped = downloaded = 0
     with httpx.Client(timeout=60, follow_redirects=True) as client:
         metadata = request_source(client, METADATA_URL, "RefCOCO repository metadata")
         revision = metadata.json()["sha"]
         for reference in iter_references(client, count):
-            existing = store.get_sample(reference.sample_id)
-            if existing and drive.image_exists(existing.image_file_id):
-                file_id = existing.image_file_id
+            file_id = images.get(reference.image_id) or drive.find_image(reference.file_name)
+            if file_id is None:
+                response = request_source(
+                    client,
+                    reference.image_url,
+                    f"COCO image {reference.image_id} for reference {reference.ref_id}",
+                )
+                content = response.content
+                load_image(content, reference.width, reference.height)
+                file_id = drive.upload_image(reference.file_name, content, "image/jpeg")
+                downloaded += 1
+            images[reference.image_id] = file_id
+            existing = store.get_annotation(reference.ref_id)
+            if existing is None:
+                store.save_annotation(reference.sample_record(file_id))
+                action = "Imported"
+            elif existing.image_file_id != file_id:
+                store.replace_annotation_image(reference.ref_id, file_id)
+                action = "Repaired"
+            else:
                 skipped += 1
                 action = "Skipped"
-            else:
-                file_id = drive.find_sample(reference.image_key)
-                if file_id is None:
-                    response = request_source(
-                        client,
-                        reference.image_url,
-                        f"COCO image {reference.image_id} for reference {reference.ref_id}",
-                    )
-                    content = response.content
-                    load_image(content, reference.width, reference.height)
-                    file_id = drive.upload_sample(
-                        content, "image/jpeg", source_key=reference.image_key
-                    )
-                    downloaded += 1
-                if existing:
-                    store.replace_sample_image(existing.id, file_id)
-                else:
-                    store.save_sample(reference.sample_record(file_id))
-                action = "Imported"
-            image_ids.add(file_id)
-            processed += 1
-            print(f"{action} {processed}/{count}: reference {reference.ref_id}", flush=True)
+            objects += 1
+            print(f"{action} reference {reference.ref_id}, image {len(images)}/{count}", flush=True)
         latest = request_source(client, METADATA_URL, "RefCOCO repository metadata after import")
         if latest.json()["sha"] != revision:
             raise ValueError(
                 "The annotation mirror changed during import. Check it before continuing."
             )
     return {
-        "sample_rows": processed,
-        "unique_images": len(image_ids),
+        "sample_rows": objects,
+        "unique_images": len(images),
         "downloaded": downloaded,
         "skipped": skipped,
-        "dataset": DATASET,
     }
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    root = argparse.ArgumentParser(description="Import RefCOCO into Google Drive and Supabase.")
+    root.add_argument(
+        "--count",
+        type=positive_int,
+        default=10,
+        help="Number of source images; every referred object in them is imported.",
+    )
+    args = root.parse_args(argv)
+    load_dotenv(Path.cwd() / ".env", override=False)
+    try:
+        client = create_supabase_client()
+        if not check_supabase_connection(client)["ready"]:
+            raise SupabaseError(
+                "Supabase is not ready. Run the supabase/ SQL files in order in the SQL Editor."
+            )
+        drive = create_drive_client()
+        drive.check_connection()
+        summary = import_refcoco(drive, SupabaseStore(client), args.count)
+        print(json.dumps(summary, indent=2))
+        return 0
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        httpx.HTTPError,
+        DatasetError,
+        SupabaseError,
+        DriveError,
+    ) as error:
+        # Provider wrappers intentionally avoid printing credentials or raw server bodies.
+        message = (
+            "Dataset request failed; check the source endpoint and connectivity."
+            if isinstance(error, httpx.HTTPError)
+            else str(error)
+        )
+        print(f"Error: {message}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

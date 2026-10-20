@@ -4,13 +4,22 @@ import math
 import os
 from collections.abc import Sequence
 from typing import Annotated, Literal, Self
-from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+def text_limit(limit: int) -> AfterValidator:
+    # A validator, not a schema keyword: OpenAI strict schemas reject minLength/maxLength.
+    def check(value: str) -> str:
+        if not 1 <= len(value) <= limit:
+            raise ValueError(f"Text must be 1 to {limit} characters.")
+        return value
+
+    return AfterValidator(check)
 
 
 class Box(StrictModel):
@@ -83,7 +92,6 @@ class Sample(StrictModel):
     # One database target passed to the agent loop.
 
     ref_id: int = Field(ge=0)
-    sample_id: UUID
     image_file_id: str = Field(min_length=1)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
@@ -92,15 +100,15 @@ class Sample(StrictModel):
 
 
 class Candidate(StrictModel):
-    referring_expression: str = Field(min_length=1, max_length=400)
-    strategy: str = Field(min_length=1, max_length=400)
+    referring_expression: Annotated[str, text_limit(400)]
+    strategy: Annotated[str, text_limit(400)]
 
 
 class ChallengerDirection(StrictModel):
     # The main LLM's brief assessment and instructions for the next candidate.
 
-    assessment: str = Field(min_length=1, max_length=1000)
-    challenger_prompt: str = Field(min_length=1, max_length=1600)
+    assessment: Annotated[str, text_limit(1000)]
+    challenger_prompt: Annotated[str, text_limit(1600)]
 
 
 class Prediction(StrictModel):
@@ -121,20 +129,20 @@ class GroundingAnswer(StrictModel):
         return Prediction(bbox=Box.from_xyxy(self.bbox_2d))
 
 
-class SampleRecord(GroundingAnswer):
+class AnnotationRecord(GroundingAnswer):
     # One annotated object; several objects may share the same Drive image.
 
-    id: UUID
     image_file_id: str = Field(min_length=1)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     referring_expressions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
-    dataset: str = Field(min_length=1)
+    coco_image_id: int = Field(gt=0)
+    ref_id: int = Field(ge=0)
+    category: str = Field(min_length=1)
 
-    def as_sample(self, ref_id: int) -> Sample:
+    def as_sample(self) -> Sample:
         return Sample(
-            ref_id=ref_id,
-            sample_id=self.id,
+            ref_id=self.ref_id,
             image_file_id=self.image_file_id,
             width=self.width,
             height=self.height,
@@ -143,14 +151,19 @@ class SampleRecord(GroundingAnswer):
         )
 
 
-class OutputRecord(GroundingAnswer):
-    # A stored training example, linked to the attempt that produced it.
+class AcceptedExample(GroundingAnswer):
+    # A training example: an accepted round joined to its annotation.
 
-    attempt_id: UUID
     image_file_id: str = Field(min_length=1)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     referring_expression: str = Field(min_length=1, max_length=400)
+
+    @classmethod
+    def from_round_row(cls, row: dict) -> "AcceptedExample":
+        return cls.model_validate(
+            {"referring_expression": row["referring_expression"], **row["refcoco_annotations"]}
+        )
 
 
 class Round(StrictModel):
@@ -173,10 +186,12 @@ class Result(StrictModel):
 
 
 class Settings(StrictModel):
-    main_model: str = "gpt-5.4-nano"
-    challenger_model: str = "gpt-5.4-nano"
-    strong_model: str = "gpt-5.4-nano"
-    weak_model: str = "qwen/qwen3-vl-8b-instruct"
+    # Model IDs have no defaults in code; `run` reads all four from .env.
+    main_model: str = Field(min_length=1)
+    challenger_model: str = Field(min_length=1)
+    strong_provider: Literal["openai", "openrouter"] = "openrouter"
+    strong_model: str = Field(min_length=1)
+    weak_model: str = Field(min_length=1)
     max_rounds: int = Field(default=3, ge=1, le=20)
     iou_threshold: float = Field(default=0.5, gt=0, le=1)
     min_iou_gap: float = Field(default=0.2, ge=0, le=1)
@@ -186,10 +201,19 @@ class Settings(StrictModel):
     @classmethod
     def from_env(cls, **overrides: object) -> "Settings":
         models = {}
+        missing = []
         for role in ("main", "challenger", "strong", "weak"):
-            value = os.getenv(f"AUTODATA_{role.upper()}_MODEL", "").strip()
+            name = f"AUTODATA_{role.upper()}_MODEL"
+            value = os.getenv(name, "").strip()
             if value:
                 models[f"{role}_model"] = value
+            else:
+                missing.append(name)
+        if missing:
+            raise ValueError(f"Set {', '.join(missing)} in .env.")
+        provider = os.getenv("AUTODATA_STRONG_PROVIDER", "").strip().lower()
+        if provider:
+            models["strong_provider"] = provider
         return cls(**(models | overrides))
 
 

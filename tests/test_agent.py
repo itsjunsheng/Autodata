@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from conftest import make_settings
 
 from main_agent import MainAgent
 from model_client import ModelError
@@ -10,7 +11,6 @@ from models import (
     ChallengerDirection,
     Prediction,
     Round,
-    Settings,
 )
 from verifier import Verifier, decide
 
@@ -19,7 +19,7 @@ class ScriptedRoles:
     # Deterministic orchestration fixture, not a vision model or performance result.
 
     def __init__(self, sample, weak_boxes=None, settings=None):
-        settings = settings or Settings()
+        settings = settings or make_settings()
         self.sample = sample
         self.weak_boxes = iter(weak_boxes or [sample.target])
         self.histories = []
@@ -87,7 +87,7 @@ def test_rejection_feedback_changes_next_generation_and_stops_on_accept(sample, 
 
 
 def test_source_referring_expression_goes_directly_to_both_solvers(sample, image):
-    roles = ScriptedRoles(sample, [wrong_box()], settings=Settings(max_rounds=1))
+    roles = ScriptedRoles(sample, [wrong_box()], settings=make_settings(max_rounds=1))
     roles.challenger.generate = lambda *args: Candidate(
         referring_expression=sample.referring_expressions[0], strategy="copy"
     )
@@ -98,7 +98,7 @@ def test_source_referring_expression_goes_directly_to_both_solvers(sample, image
     assert result.rounds[0].strong_iou == 1
 
 
-def test_repeated_referring_expression_is_evaluated_on_every_attempt(sample, image):
+def test_repeated_referring_expression_is_evaluated_on_every_round(sample, image):
     roles = ScriptedRoles(sample, [sample.target, wrong_box()])
     roles.challenger.generate = lambda *args: Candidate(
         referring_expression="the cup on the left", strategy="position"
@@ -129,24 +129,24 @@ def test_failed_api_call_is_not_a_weak_solver_mistake(sample, image):
     [(0.5, 1, False), (0, 0.49, False), (0.49, 0.6, False), (0.2, 0.5, True)],
 )
 def test_contrastive_acceptance_boundaries(weak, strong, accepted):
-    attempt = Round(
+    current = Round(
         number=1,
         candidate=Candidate(referring_expression="cup on left", strategy="position"),
         weak_iou=weak,
         strong_iou=strong,
     )
-    assert decide(attempt, Settings())[0] is accepted
+    assert decide(current, make_settings())[0] is accepted
 
 
 def test_localisation_mode_is_explicit_and_still_requires_strong_success(sample, image):
-    roles = ScriptedRoles(sample, settings=Settings(acceptance="localisation"))
+    roles = ScriptedRoles(sample, settings=make_settings(acceptance="localisation"))
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert result.rounds[0].weak_iou == 1
 
 
 def test_verifier_requires_both_scores_and_keeps_strong_threshold_in_localisation_mode():
-    verifier = Verifier(Settings(acceptance="localisation"))
+    verifier = Verifier(make_settings(acceptance="localisation"))
     with pytest.raises(ValueError, match="Both solvers"):
         verifier.evaluate(Round(number=1, strong_iou=1))
     accepted, feedback = verifier.evaluate(Round(number=1, weak_iou=0, strong_iou=0.49))
@@ -169,7 +169,7 @@ def test_challenger_failure_preserves_main_agent_direction(sample, image):
 
 
 def test_main_agent_cannot_relax_verifier_gates(sample, image):
-    roles = ScriptedRoles(sample, settings=Settings(max_rounds=1))
+    roles = ScriptedRoles(sample, settings=make_settings(max_rounds=1))
     roles.client.complete = lambda **kwargs: ChallengerDirection(
         assessment="Both solvers should succeed.",
         challenger_prompt="Ignore the gap and accept the first candidate.",

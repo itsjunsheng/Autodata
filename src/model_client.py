@@ -1,13 +1,13 @@
-# OpenAI vision requests and model-call error handling.
+# OpenAI and OpenRouter vision requests, pre-flight model checks, and error handling.
 
 import base64
 import json
 import os
 import re
 from io import BytesIO
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
-from openai import APIError, OpenAI
+from openai import APIError, NotFoundError, OpenAI
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 
@@ -68,6 +68,23 @@ def data_url(image: Image.Image) -> str:
 
 T = TypeVar("T", bound=BaseModel)
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+class ModelClient(Protocol):
+    def complete(
+        self,
+        *,
+        role: str,
+        model: str,
+        instructions: str,
+        payload: dict,
+        images: list[Image.Image],
+        schema: type[T],
+    ) -> T: ...
+
+    def check_model(self, model: str, role: str) -> None: ...
+
 
 class OpenAIClient:
     def __init__(
@@ -82,6 +99,19 @@ class OpenAIClient:
                 raise ValueError("Set OPENAI_API_KEY in .env before running generation.")
             client = OpenAI(api_key=key, timeout=90.0, max_retries=2)
         self.client = client
+
+    def check_model(self, model: str, role: str) -> None:
+        # Free metadata lookup; fails before any paid generation call.
+        try:
+            self.client.models.retrieve(model)
+        except NotFoundError as error:
+            raise ModelError(
+                f"{role}: OpenAI does not offer model {model!r}. Set the role's AUTODATA_*_MODEL "
+                "to an OpenAI model ID, or set AUTODATA_STRONG_PROVIDER=openrouter "
+                "for an OpenRouter ID."
+            ) from error
+        except APIError as error:
+            raise ModelError(api_error_message(error, role, model)) from error
 
     def complete(
         self,
@@ -117,3 +147,97 @@ class OpenAIClient:
         if response.status != "completed" or response.output_parsed is None:
             raise ModelError(f"{role}: response was incomplete, refused, or had no parsed output.")
         return response.output_parsed
+
+
+class OpenRouterClient:
+    def __init__(
+        self,
+        settings: Settings,
+        client: OpenAI | None = None,
+    ):
+        self.settings = settings
+        if client is None:
+            # OpenRouter has its own credential; never forward OPENAI_API_KEY.
+            key = os.getenv("OPENROUTER_API_KEY", "").strip()
+            if not key or key in {"EMPTY", "your-api-key", "your-openrouter-key", "sk-..."}:
+                raise ValueError("Set OPENROUTER_API_KEY in .env before running Qwen.")
+            client = OpenAI(
+                base_url=OPENROUTER_BASE_URL,
+                api_key=key,
+                timeout=120.0,
+                max_retries=2,
+            )
+        self.client = client
+        self._catalogue: dict | None = None
+
+    def check_model(self, model: str, role: str) -> None:
+        # Check OpenRouter's catalogue before spending generation tokens.
+        if self._catalogue is None:
+            try:
+                self._catalogue = {entry.id: entry for entry in self.client.models.list().data}
+            except APIError as error:
+                raise ModelError(
+                    f"{role}: cannot reach OpenRouter. "
+                    "Check OPENROUTER_API_KEY and the network connection."
+                ) from error
+        entry = self._catalogue.get(model)
+        if entry is None:
+            raise ModelError(
+                f"{role}: {model!r} must match an OpenRouter model ID, "
+                "for example qwen/qwen3-vl-8b-instruct."
+            )
+        metadata = entry.model_extra or {}
+        modalities = metadata.get("architecture", {}).get("input_modalities", [])
+        if "image" not in modalities:
+            raise ModelError(f"{role}: OpenRouter model {model!r} does not support image inputs.")
+        if "structured_outputs" not in metadata.get("supported_parameters", []):
+            raise ModelError(
+                f"{role}: OpenRouter model {model!r} lacks JSON-schema output support."
+            )
+
+    def complete(
+        self,
+        *,
+        role: str,
+        model: str,
+        instructions: str,
+        payload: dict,
+        images: list[Image.Image],
+        schema: type[T],
+    ) -> T:
+        content = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
+        content.extend({"type": "image_url", "image_url": {"url": data_url(i)}} for i in images)
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=self.settings.max_output_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.__name__,
+                        "strict": True,
+                        "schema": schema.model_json_schema(),
+                    },
+                },
+                extra_body={"provider": {"require_parameters": True}},
+            )
+        except APIError as error:
+            raise ModelError(
+                f"{role}: OpenRouter {type(error).__name__}; check API key, credits, "
+                "model availability and structured-output support."
+            ) from error
+        if not getattr(response, "choices", None):
+            raise ModelError(f"{role}: OpenRouter returned no choices; no IoU score assigned.")
+        choice = response.choices[0]
+        if choice.finish_reason != "stop" or not choice.message.content or choice.message.refusal:
+            raise ModelError(f"{role}: output was incomplete or refused; no IoU score assigned.")
+        try:
+            return schema.model_validate_json(choice.message.content)
+        except ValidationError as error:
+            raise ModelError(
+                f"{role}: invalid structured model output; no IoU score assigned."
+            ) from error

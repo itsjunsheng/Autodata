@@ -13,17 +13,17 @@ def iou(first: Box, second: Box) -> float:
     return intersection / (first_area + second_area - intersection)
 
 
-def decide(attempt: Round, settings: Settings) -> tuple[bool, str]:
+def decide(current: Round, settings: Settings) -> tuple[bool, str]:
     # Compare measured scores with fixed thresholds; never judge the referring expression.
-    if attempt.strong_iou is None or attempt.weak_iou is None:
+    if current.strong_iou is None or current.weak_iou is None:
         raise ValueError("Both solvers must be evaluated before acceptance.")
-    if attempt.strong_iou < settings.iou_threshold:
+    if current.strong_iou < settings.iou_threshold:
         return False, "Strong solver missed the target. Clarify visible distinguishing details."
     if settings.acceptance == "localisation":
         return True, "Strong-solver IoU passed the localisation threshold."
-    if attempt.weak_iou >= settings.iou_threshold:
+    if current.weak_iou >= settings.iou_threshold:
         return False, "Too easy for the weak solver. Try a different meaningful visible relation."
-    if attempt.strong_iou - attempt.weak_iou < settings.min_iou_gap:
+    if current.strong_iou - current.weak_iou < settings.min_iou_gap:
         return False, "Insufficient solver gap. Try a different visible description of the target."
     return True, "Strong-solver IoU passed; weak-solver IoU failed; required IoU gap passed."
 
@@ -36,5 +36,5 @@ class Verifier:
     def score(prediction: Prediction, target: Box) -> float:
         return iou(prediction.bbox, target)
 
-    def evaluate(self, attempt: Round) -> tuple[bool, str]:
-        return decide(attempt, self.settings)
+    def evaluate(self, current: Round) -> tuple[bool, str]:
+        return decide(current, self.settings)

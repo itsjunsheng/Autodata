@@ -27,45 +27,43 @@ class MemorySupabase:
     # Exercise the real Python SDK through its HTTP interface.
 
     def __init__(self):
-        self.tables = {name: {} for name in ("samples", "runs", "attempts", "outputs")}
+        self.tables = {name: {} for name in ("refcoco_annotations", "runs", "rounds")}
         self.requests = []
-        self.fail_attempt_write = False
-        self.fail_sample_write = False
-        self.fail_output_write = False
+        self.fail_round_write = False
+        self.fail_annotation_write = False
         self.client = mock_client(self.respond)
 
     def seed(self, record):
-        self.tables["samples"][str(record.id)] = record.model_dump(mode="json")
-
-    def outputs_for(self, run_id):
-        return [
-            row.copy()
-            for row in sorted(self.tables["outputs"].values(), key=lambda row: row["attempt_id"])
-            if self.tables["attempts"][row["attempt_id"]]["run_id"] == run_id
-        ]
+        self.tables["refcoco_annotations"][record.ref_id] = record.model_dump(mode="json")
 
     def respond(self, request):
         self.requests.append(request)
         assert request.url.path.startswith("/rest/v1/"), "Supabase Storage must never be called"
         table = request.url.path.removeprefix("/rest/v1/")
         if request.method == "GET":
-            if table == "outputs":
-                run_id = request.url.params.get("attempts.run_id")
-                rows = self.outputs_for(run_id[3:]) if run_id else []
-                if "attempts!inner" in request.url.params.get("select", ""):
-                    rows = [dict(row, attempts={"run_id": run_id[3:]}) for row in rows]
-            else:
-                rows = list(self.tables[table].values())
-                for ordering in reversed(request.url.params.get("order", "id.asc").split(",")):
-                    field, direction = ordering.split(".")[:2]
-                    rows.sort(key=lambda row: row.get(field, ""), reverse=direction == "desc")
-                for field in ("id", "dataset"):
-                    value = request.url.params.get(field)
-                    if value:
-                        rows = [row for row in rows if row[field] == value[3:]]
-                if table == "samples":
-                    fields = request.url.params["select"].split(",")
-                    rows = [{field: row[field] for field in fields} for row in rows]
+            rows = list(self.tables[table].values())
+            for ordering in reversed(request.url.params.get("order", "ref_id.asc").split(",")):
+                field, direction = ordering.split(".")[:2]
+                rows.sort(key=lambda row: row.get(field, ""), reverse=direction == "desc")
+            for field, value in request.url.params.items():
+                if value.startswith("eq."):
+                    rows = [row for row in rows if str(row[field]) == value[3:]]
+            select = request.url.params.get("select", "")
+            if table == "refcoco_annotations":
+                fields = select.split(",")
+                rows = [{field: row[field] for field in fields} for row in rows]
+            elif "refcoco_annotations(" in select:
+                embedded = select.partition("(")[2].rstrip(")").split(",")
+                rows = [
+                    {
+                        "referring_expression": row["referring_expression"],
+                        "refcoco_annotations": {
+                            field: self.tables["refcoco_annotations"][row["ref_id"]][field]
+                            for field in embedded
+                        },
+                    }
+                    for row in rows
+                ]
             offset = int(request.url.params.get("offset", 0))
             limit = int(request.url.params.get("limit", len(rows)))
             return httpx.Response(
@@ -74,39 +72,31 @@ class MemorySupabase:
                 headers={"Content-Range": f"*/{len(rows)}"},
             )
         row = json.loads(request.content)
-        if (
-            (self.fail_attempt_write and table == "attempts")
-            or (self.fail_sample_write and table == "samples")
-            or (self.fail_output_write and table == "attempts" and row.get("status") == "accepted")
+        if (self.fail_round_write and table == "rounds") or (
+            self.fail_annotation_write and table == "refcoco_annotations"
         ):
             return httpx.Response(
                 403, json={"code": "42501", "message": TEST_KEY, "hint": None, "details": None}
             )
         if request.method == "PATCH":
-            existing = self.tables[table].get(request.url.params["id"][3:])
+            if table == "refcoco_annotations":
+                existing = self.tables[table].get(int(request.url.params["ref_id"][3:]))
+            else:
+                existing = self.tables[table].get(request.url.params["id"][3:])
             if existing is None:
                 return httpx.Response(200, json=[])
             existing.update(row)
             return httpx.Response(200, json=[existing])
         assert request.method == "POST"
+        key = {
+            "rounds": lambda: (row["run_id"], row["ref_id"], row["round_number"]),
+            "refcoco_annotations": lambda: row["ref_id"],
+            "runs": lambda: row["id"],
+        }[table]()
         if "resolution=ignore-duplicates" in request.headers.get("prefer", ""):
-            self.tables[table].setdefault(row["id"], row)
+            self.tables[table].setdefault(key, row)
         else:
-            self.tables[table][row["id"]] = row
-        # Simulate the setup.sql trigger; real PostgreSQL is checked separately.
-        if table == "attempts" and row["status"] == "accepted":
-            sample_record = self.tables["samples"][row["sample_id"]]
-            self.tables["outputs"].setdefault(
-                row["id"],
-                {
-                    "attempt_id": row["id"],
-                    "image_file_id": sample_record["image_file_id"],
-                    "width": sample_record["width"],
-                    "height": sample_record["height"],
-                    "referring_expression": row["referring_expression"],
-                    "bbox_2d": list(sample_record["bbox_2d"]),
-                },
-            )
+            self.tables[table][key] = row
         return httpx.Response(200, json=[row])
 
 
@@ -114,7 +104,7 @@ def test_connection_is_read_only_and_never_requires_storage():
     memory = MemorySupabase()
     report = check_supabase_connection(memory.client)
     assert report == {"connected": True, "ready": True, "schema_issues": []}
-    assert len(memory.requests) == 4
+    assert len(memory.requests) == 3
     assert all(request.method == "GET" for request in memory.requests)
     assert TEST_KEY not in json.dumps(report)
 
@@ -122,7 +112,7 @@ def test_connection_is_read_only_and_never_requires_storage():
 @pytest.mark.parametrize("code", ["PGRST205", "42703"])
 def test_missing_tables_or_columns_are_reported(code):
     def respond(request):
-        if request.url.path.endswith("/attempts"):
+        if request.url.path.endswith("/rounds"):
             return httpx.Response(
                 404, json={"code": code, "message": "Missing schema", "hint": None, "details": None}
             )
@@ -130,7 +120,7 @@ def test_missing_tables_or_columns_are_reported(code):
 
     report = check_supabase_connection(mock_client(respond))
     assert report["connected"] and not report["ready"]
-    assert report["schema_issues"] == ["attempts"]
+    assert report["schema_issues"] == ["rounds"]
 
 
 @pytest.mark.parametrize("failure", ["database", "network"])
@@ -175,7 +165,7 @@ def test_cli_reports_connection_without_calling_models(monkeypatch, capsys, read
     assert '"connected": true' in capsys.readouterr().out
 
 
-def test_cli_missing_key_creates_no_outputs(monkeypatch, capsys, tmp_path):
+def test_cli_missing_key_creates_no_local_files(monkeypatch, capsys, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SUPABASE_URL", PROJECT_URL)
     monkeypatch.setenv("SUPABASE_API_KEY", "")

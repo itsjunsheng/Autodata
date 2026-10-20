@@ -1,10 +1,11 @@
-# Authenticate with Google and store sample images and attempt images in Drive.
+# Authenticate with Google; store originals in images/ and round previews in previews/ in Drive.
+# The code never creates folders: the user creates images/ and previews/ in the root by hand.
 
 import hashlib
 import os
 import re
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import httplib2
 from google.auth.exceptions import GoogleAuthError
@@ -20,8 +21,9 @@ from requests.exceptions import RequestException
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
+IMAGES_FOLDER = "images"
+PREVIEWS_FOLDER = "previews"
 IMAGE_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-SAMPLE_NAME = re.compile(r"sample ([1-9]\d*)\.(jpg|jpeg|png|webp)")
 
 
 class DriveError(RuntimeError):
@@ -101,21 +103,17 @@ def create_drive_client() -> "GoogleDrive":
 
 
 class GoogleDrive:
-    # Use only the configured root folder, reusing files by their relative paths.
+    # Use only two hand-made folders inside the configured root, reusing files by name.
 
     def __init__(self, service: Resource, folder_id: str):
         self.files = service.files()
         self.folder_id = validate_file_id(folder_id)
-        self.folders: dict[str, str] = {"": self.folder_id}
-        self.sample_files: dict[tuple[str, int], dict] | None = None
-        self.next_sample_number = 1
+        self.folders: dict[str, str] = {}
 
-    def _execute(self, request, *, allow_missing: bool = False):
+    def _execute(self, request):
         try:
             return request.execute(num_retries=2)
         except HttpError as error:
-            if allow_missing and error.resp.status == 404:
-                return None
             raise DriveError(
                 f"Google Drive request failed (HTTP {error.resp.status}). "
                 "Check account permissions, available storage, and API quotas."
@@ -126,7 +124,7 @@ class GoogleDrive:
             ) from error
 
     def check_connection(self) -> dict:
-        # Check the root folder without uploading files or creating folders.
+        # Check the root and its two folders without uploading files or creating folders.
         folder = self._execute(
             self.files.get(
                 fileId=self.folder_id,
@@ -138,23 +136,18 @@ class GoogleDrive:
             raise DriveError("GOOGLE_DRIVE_FOLDER_ID must identify an existing, untrashed folder.")
         if not folder.get("capabilities", {}).get("canAddChildren"):
             raise DriveError("Your Google account cannot upload into the configured folder.")
-        return {"connected": True, "folder_id": self.folder_id, "folder_name": folder["name"]}
+        return {
+            "connected": True,
+            "folder_id": self.folder_id,
+            "folder_name": folder["name"],
+            "folders": {name: self._folder(name) for name in (IMAGES_FOLDER, PREVIEWS_FOLDER)},
+        }
 
-    def _find(
-        self, parent_id: str, name: str | None = None, *, source_key: str | None = None
-    ) -> dict | None:
-        value = name if name is not None else source_key
-        if value is None:
-            raise ValueError("A file name or source key is required.")
-        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-        condition = (
-            f"name = '{escaped}'"
-            if name is not None
-            else f"properties has {{ key='autodata_source' and value='{escaped}' }}"
-        )
+    def _find(self, parent_id: str, name: str) -> dict | None:
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
         response = self._execute(
             self.files.list(
-                q=f"'{parent_id}' in parents and {condition} and trashed = false",
+                q=f"'{parent_id}' in parents and name = '{escaped}' and trashed = false",
                 fields="files(id,mimeType,md5Checksum,size),nextPageToken,incompleteSearch",
                 pageSize=2,
                 spaces="drive",
@@ -166,67 +159,40 @@ class GoogleDrive:
             raise DriveError("Drive returned an incomplete file search. Try again.")
         matches = response.get("files", [])
         if len(matches) > 1 or response.get("nextPageToken"):
-            raise DriveError(
-                f"Duplicate files in the Drive folder for {value}. Resolve them first."
-            )
+            raise DriveError(f"Duplicate files in the Drive folder for {name}. Resolve them first.")
         return matches[0] if matches else None
 
-    def image_exists(self, file_id: str) -> bool:
-        # Read file metadata only; permission and network errors still stop the import.
-        metadata = self._execute(
-            self.files.get(
-                fileId=validate_file_id(file_id),
-                fields="mimeType,trashed,size",
-                supportsAllDrives=True,
-            ),
-            allow_missing=True,
-        )
-        if metadata is None or metadata.get("trashed"):
-            return False
-        if metadata.get("mimeType") not in IMAGE_SUFFIXES or int(metadata.get("size", 0)) <= 0:
-            raise DriveError("The linked sample file is not a non-empty image.")
-        return True
-
-    def find_sample(self, source_key: str) -> str | None:
-        # Find a completed image upload even if its Supabase insert failed.
-        found = self._find(self._folder(("samples",)), source_key=source_key)
+    def find_image(self, name: str) -> str | None:
+        # Find a completed upload by its COCO file name even if its Supabase insert failed.
+        found = self._find(self._folder(IMAGES_FOLDER), name)
         if found is None:
             return None
         if found.get("mimeType") not in IMAGE_SUFFIXES or int(found.get("size", 0)) <= 0:
-            raise DriveError("The stored source identifier points to an invalid sample image.")
+            raise DriveError("The stored file for this image name is not a non-empty image.")
         return validate_file_id(found["id"])
 
-    def _folder(self, parts: tuple[str, ...]) -> str:
-        parent = self.folder_id
-        for index, name in enumerate(parts):
-            key = "/".join(parts[: index + 1])
-            if key not in self.folders:
-                found = self._find(parent, name)
-                if found and found["mimeType"] != FOLDER_MIME:
-                    raise DriveError(f"A file occupies the expected Drive folder: {key}")
-                if not found:
-                    found = self._execute(
-                        self.files.create(
-                            body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent]},
-                            fields="id",
-                            supportsAllDrives=True,
-                        )
-                    )
-                self.folders[key] = validate_file_id(found["id"])
-            parent = self.folders[key]
-        return parent
+    def _folder(self, name: str) -> str:
+        # Look up a folder the user made by hand; the code never creates one.
+        if name not in self.folders:
+            found = self._find(self.folder_id, name)
+            if found is None or found.get("mimeType") != FOLDER_MIME:
+                raise DriveError(
+                    f"Create a folder named '{name}' inside the configured Drive folder; "
+                    "the code never creates folders."
+                )
+            self.folders[name] = validate_file_id(found["id"])
+        return self.folders[name]
 
     def upload(
-        self, path: str, content: bytes, content_type: str, *, immutable: bool = False
+        self, folder: str, name: str, content: bytes, content_type: str, *, immutable: bool = False
     ) -> str:
-        # Reuse clean sample images; update an existing attempt image without making copies.
-        relative = PurePosixPath(path)
-        if relative.is_absolute() or ".." in relative.parts or not relative.name or "\\" in path:
-            raise DriveError("Drive upload paths must be relative to the configured root folder.")
-        parent = self._folder(relative.parts[:-1])
-        found = self._find(parent, relative.name)
+        # Reuse a matching original; update an existing round preview without making copies.
+        if not name or "/" in name or "\\" in name:
+            raise DriveError("Drive file names must not be empty or contain slashes.")
+        parent = self._folder(folder)
+        found = self._find(parent, name)
         if found and found.get("mimeType") == FOLDER_MIME:
-            raise DriveError("A folder occupies the expected Drive file path.")
+            raise DriveError("A folder occupies the expected Drive file name.")
         existing_id = found["id"] if found else None
         if immutable and existing_id:
             metadata = found
@@ -245,108 +211,18 @@ class GoogleDrive:
             )
         else:
             request = self.files.create(
-                body={"name": relative.name, "parents": [parent], "mimeType": content_type},
+                body={"name": name, "parents": [parent], "mimeType": content_type},
                 media_body=media,
                 fields="id",
                 supportsAllDrives=True,
             )
-        file_id = validate_file_id(self._execute(request)["id"])
-        return file_id
+        return validate_file_id(self._execute(request)["id"])
 
-    def _load_sample_files(self) -> None:
-        # Read lightweight metadata once per import, including every Drive page.
-        if self.sample_files is not None:
-            return
-        parent = self._folder(("samples",))
-        files = {}
-        next_number = 1
-        page_token = None
-        while True:
-            response = self._execute(
-                self.files.list(
-                    q=f"'{parent}' in parents and trashed = false",
-                    fields="files(id,name,mimeType,md5Checksum,size),nextPageToken,incompleteSearch",
-                    pageSize=1000,
-                    pageToken=page_token,
-                    spaces="drive",
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                )
-            )
-            if response.get("incompleteSearch"):
-                raise DriveError("Drive returned an incomplete sample listing. Try again.")
-            for metadata in response.get("files", []):
-                match = SAMPLE_NAME.fullmatch(metadata["name"])
-                if match:
-                    next_number = max(next_number, int(match[1]) + 1)
-                if metadata.get("mimeType") in IMAGE_SUFFIXES and metadata.get("md5Checksum"):
-                    key = (metadata["md5Checksum"], int(metadata["size"]))
-                    files.setdefault(key, metadata)
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-        self.sample_files = files
-        self.next_sample_number = next_number
-
-    def _number_sample(self, metadata: dict) -> str:
-        # Rename a legacy image without changing its file ID or image bytes.
-        if not SAMPLE_NAME.fullmatch(metadata["name"]):
-            name = f"sample {self.next_sample_number}{IMAGE_SUFFIXES[metadata['mimeType']]}"
-            if self._find(self._folder(("samples",)), name):
-                raise DriveError("Sample numbering changed. Use one importer at a time.")
-            self._execute(
-                self.files.update(
-                    fileId=metadata["id"], body={"name": name}, fields="id", supportsAllDrives=True
-                )
-            )
-            metadata["name"] = name
-            self.next_sample_number += 1
-        return PurePosixPath(metadata["name"]).stem
-
-    def upload_sample(self, content: bytes, content_type: str, *, source_key: str) -> str:
-        # Name new images sequentially and reuse identical images across imports.
+    def upload_image(self, name: str, content: bytes, content_type: str) -> str:
+        # Store an original under its real COCO file name; a repeat upload reuses the file.
         if content_type not in IMAGE_SUFFIXES:
-            raise DriveError("Sample images must be JPEG, PNG, or WebP.")
-        self._load_sample_files()
-        key = (hashlib.md5(content, usedforsecurity=False).hexdigest(), len(content))
-        existing = self.sample_files.get(key)
-        if existing:
-            self._number_sample(existing)
-            file_id = validate_file_id(existing["id"])
-        else:
-            name = f"sample {self.next_sample_number}{IMAGE_SUFFIXES[content_type]}"
-            file_id = self.upload(f"samples/{name}", content, content_type, immutable=True)
-            self.sample_files[key] = {"id": file_id, "name": name, "mimeType": content_type}
-            self.next_sample_number += 1
-        self._execute(
-            self.files.update(
-                fileId=file_id,
-                body={"properties": {"autodata_source": source_key}},
-                fields="id",
-                supportsAllDrives=True,
-            )
-        )
-        return file_id
-
-    def sample_name(self, file_id: str) -> str:
-        # Use the original's sample number when naming its attempt images.
-        metadata = self._execute(
-            self.files.get(
-                fileId=validate_file_id(file_id),
-                fields="id,name,mimeType,md5Checksum,size,trashed",
-                supportsAllDrives=True,
-            )
-        )
-        if metadata.get("trashed") or metadata.get("mimeType") not in IMAGE_SUFFIXES:
-            raise DriveError("The sample file must be an existing image.")
-        if not SAMPLE_NAME.fullmatch(metadata["name"]):
-            self._load_sample_files()
-            key = (metadata.get("md5Checksum"), int(metadata.get("size", -1)))
-            existing = self.sample_files.get(key)
-            if existing is None or existing["id"] != file_id:
-                raise DriveError("The original image is missing from the samples folder.")
-            return self._number_sample(existing)
-        return PurePosixPath(metadata["name"]).stem
+            raise DriveError("Images must be JPEG, PNG, or WebP.")
+        return self.upload(IMAGES_FOLDER, name, content, content_type, immutable=True)
 
     def download(self, file_id: str) -> bytes:
         # Read a file into memory, with bounded retries and no disk cache.

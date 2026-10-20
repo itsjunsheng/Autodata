@@ -1,4 +1,4 @@
-# Render attempt previews in memory and explicitly export Qwen training data.
+# Render round previews in memory and explicitly export Qwen training data.
 
 import json
 import textwrap
@@ -9,44 +9,44 @@ from PIL import Image, ImageDraw, ImageFont
 
 from dataset import load_image
 from google_drive import GoogleDrive, validate_file_id
-from models import OutputRecord, Result, Round, Sample
+from models import AcceptedExample, Result, Round, Sample
 from supabase_client import SupabaseStore
 
 
-def attempt_status(result: Result, attempt: Round) -> str:
-    if result.status == "error" and attempt is result.rounds[-1]:
+def round_status(result: Result, current: Round) -> str:
+    if result.status == "error" and current is result.rounds[-1]:
         return "error"
-    if attempt.accepted:
+    if current.accepted:
         return "accepted"
-    return "rejected" if attempt.feedback else "running"
+    return "rejected" if current.feedback else "running"
 
 
-def render_attempt_image(
-    image: Image.Image, sample: Sample, attempt: Round, status: str
+def render_round_preview(
+    image: Image.Image, sample: Sample, current: Round, status: str
 ) -> Image.Image:
     # The added text and coloured boxes are inspection aids, never training inputs.
     marked = image.copy()
     draw = ImageDraw.Draw(marked)
     # Different line widths keep all three colours visible when boxes coincide.
     boxes = [(sample.target, "lime", 7)]
-    if attempt.weak:
-        boxes.append((attempt.weak.bbox, "red", 5))
-    if attempt.strong:
-        boxes.append((attempt.strong.bbox, "blue", 3))
+    if current.weak:
+        boxes.append((current.weak.bbox, "red", 5))
+    if current.strong:
+        boxes.append((current.strong.bbox, "blue", 3))
     for box, colour, width in boxes:
         draw.rectangle(box.pixels(*image.size), outline=colour, width=width)
 
     font = ImageFont.load_default(size=14)
     legends = [
         ("lime", "Ground"),
-        ("red", "Weak solver" + (" (unavailable)" if attempt.weak is None else "")),
-        ("blue", "Strong solver" + (" (unavailable)" if attempt.strong is None else "")),
+        ("red", "Weak solver" + (" (unavailable)" if current.weak is None else "")),
+        ("blue", "Strong solver" + (" (unavailable)" if current.strong is None else "")),
     ]
     legend_width = sum(20 + font.getlength(label) + 24 for _, label in legends)
     canvas_width = max(image.width, 400, int(legend_width + font.getlength(status.upper())) + 24)
     referring_expression = (
-        attempt.candidate.referring_expression
-        if attempt.candidate
+        current.candidate.referring_expression
+        if current.candidate
         else "No referring expression generated."
     )
     line_width = (canvas_width - 24) // 8
@@ -70,7 +70,7 @@ def render_attempt_image(
     return canvas
 
 
-def _training_record(example: OutputRecord, image_path: str) -> dict:
+def _training_record(example: AcceptedExample, image_path: str) -> dict:
     return {
         "images": [image_path],
         "conversations": [
@@ -98,7 +98,7 @@ def export_training(store: SupabaseStore, drive: GoogleDrive, run_id: str, outpu
     if output.exists() and any(output.iterdir()):
         raise ValueError("Training output directory is not empty; choose another --output.")
     records, downloaded = [], {}
-    for example in store.iter_outputs(run_id):
+    for example in store.iter_accepted_examples(run_id):
         file_id = validate_file_id(example.image_file_id)
         if file_id not in downloaded:
             content = drive.download(file_id)

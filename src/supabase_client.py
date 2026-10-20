@@ -1,19 +1,21 @@
-# Store grounding metadata, agent attempts, and run settings in Supabase.
+# Store grounding metadata, agent rounds, and run settings in Supabase.
 
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
-from uuid import UUID, uuid4, uuid5
+from uuid import uuid4
 
 import httpx
 from postgrest.exceptions import APIError
 from supabase import Client, ClientOptions, create_client
 
-from models import OutputRecord, Result, Sample, SampleRecord, Settings
+from models import AcceptedExample, AnnotationRecord, Result, Sample, Settings
 
-SAMPLE_FIELDS = "id,image_file_id,width,height,bbox_2d,referring_expressions,dataset"
-OUTPUT_FIELDS = "attempt_id,image_file_id,width,height,referring_expression,bbox_2d"
+ANNOTATION_FIELDS = (
+    "ref_id,image_file_id,width,height,bbox_2d,referring_expressions,coco_image_id,category"
+)
+ACCEPTED_FIELDS = "referring_expression,refcoco_annotations(image_file_id,width,height,bbox_2d)"
 PAGE_SIZE = 50
 
 
@@ -61,16 +63,15 @@ def _execute(query, operation: str):
 def check_supabase_connection(client: Client) -> dict:
     # Read-only checks of the required tables and columns; no Storage bucket.
     columns = {
-        "samples": SAMPLE_FIELDS,
+        "refcoco_annotations": ANNOTATION_FIELDS,
         "runs": (
             "id,main_model,challenger_model,weak_model,strong_model,acceptance,"
             "iou_threshold,min_iou_gap,max_rounds,status,finished_at"
         ),
-        "attempts": (
-            "id,run_id,sample_id,attempt_number,referring_expression,weak_bbox_2d,"
-            "strong_bbox_2d,weak_iou,strong_iou,status,feedback,attempt_file_id"
+        "rounds": (
+            "run_id,ref_id,round_number,referring_expression,weak_bbox_2d,"
+            "strong_bbox_2d,weak_iou,strong_iou,status,feedback,preview_file_id"
         ),
-        "outputs": OUTPUT_FIELDS,
     }
     issues = []
     for name, fields in columns.items():
@@ -94,60 +95,56 @@ class SupabaseStore:
     def __init__(self, client: Client):
         self.client = client
         self.run_id = str(uuid4())
-        self.saved_attempts: dict[str, dict] = {}
+        self.saved_rounds: dict[tuple[int, int], dict] = {}
 
-    def save_sample(self, record: SampleRecord) -> None:
+    def save_annotation(self, record: AnnotationRecord) -> None:
         _execute(
-            self.client.table("samples").upsert(
-                record.model_dump(mode="json"), on_conflict="id", ignore_duplicates=True
+            self.client.table("refcoco_annotations").upsert(
+                record.model_dump(mode="json"), on_conflict="ref_id", ignore_duplicates=True
             ),
-            "save the sample",
+            "save the annotation",
         )
 
-    def get_sample(self, sample_id: UUID) -> SampleRecord | None:
+    def get_annotation(self, ref_id: int) -> AnnotationRecord | None:
         rows = _execute(
-            self.client.table("samples").select(SAMPLE_FIELDS).eq("id", str(sample_id)).limit(1),
-            "look up the sample",
+            self.client.table("refcoco_annotations")
+            .select(ANNOTATION_FIELDS)
+            .eq("ref_id", ref_id)
+            .limit(1),
+            "look up the annotation",
         ).data
-        return SampleRecord.model_validate(rows[0]) if rows else None
+        return AnnotationRecord.model_validate(rows[0]) if rows else None
 
-    def replace_sample_image(self, sample_id: UUID, file_id: str) -> None:
-        # Repair a missing image link while preserving the sample's labels.
+    def replace_annotation_image(self, ref_id: int, file_id: str) -> None:
+        # Repair a missing image link while preserving the annotation's labels.
         rows = _execute(
-            self.client.table("samples")
+            self.client.table("refcoco_annotations")
             .update({"image_file_id": file_id})
-            .eq("id", str(sample_id)),
-            "repair the sample image link",
+            .eq("ref_id", ref_id),
+            "repair the annotation image link",
         ).data
         if not rows:
-            raise SupabaseError("The sample was removed during import. Rerun the command.")
+            raise SupabaseError("The annotation was removed during import. Rerun the command.")
 
-    def _sample_query(self, dataset: str | None):
-        query = self.client.table("samples").select(SAMPLE_FIELDS)
-        return query.eq("dataset", dataset) if dataset else query
-
-    def sample_count(self, dataset: str | None = None) -> int:
-        query = self.client.table("samples").select("id", count="exact")
-        if dataset:
-            query = query.eq("dataset", dataset)
+    def annotation_count(self) -> int:
+        query = self.client.table("refcoco_annotations").select("ref_id", count="exact")
         response = _execute(query.limit(0), "count samples")
         if response.count is None:
-            raise SupabaseError("Supabase did not return the sample count.")
+            raise SupabaseError("Supabase did not return the annotation count.")
         return response.count
 
-    def iter_samples(
-        self, limit: int, *, offset: int = 0, dataset: str | None = None
-    ) -> Iterator[Sample]:
-        # Read bounded pages in import order; UUIDs break timestamp ties.
+    def iter_samples(self, limit: int, *, offset: int = 0) -> Iterator[Sample]:
+        # Read bounded pages in import order; ref_id breaks timestamp ties.
         if limit < 1 or offset < 0:
             raise ValueError("limit must be positive and offset must be non-negative")
         loaded = 0
         while loaded < limit:
             size = min(PAGE_SIZE, limit - loaded)
             rows = _execute(
-                self._sample_query(dataset)
+                self.client.table("refcoco_annotations")
+                .select(ANNOTATION_FIELDS)
                 .order("created_at")
-                .order("id")
+                .order("ref_id")
                 .range(offset + loaded, offset + loaded + size - 1),
                 "read samples",
             ).data
@@ -155,7 +152,7 @@ class SupabaseStore:
                 raise SupabaseError("Samples changed during the run. Start a new batch.")
             for row in rows:
                 loaded += 1
-                yield SampleRecord.model_validate(row).as_sample(offset + loaded)
+                yield AnnotationRecord.model_validate(row).as_sample()
 
     def start(self, settings: Settings) -> None:
         _execute(
@@ -180,31 +177,31 @@ class SupabaseStore:
             "start the run",
         )
 
-    def save_attempt(self, result: Result, status: str, attempt_file_id: str | None = None) -> None:
-        # Checkpoint a loop; the database also inserts its output when accepted.
-        attempt = result.rounds[-1]
-        identifier = str(uuid5(UUID(self.run_id), f"{result.sample.sample_id}:{attempt.number}"))
+    def save_round(self, result: Result, status: str, preview_file_id: str | None = None) -> None:
+        # Checkpoint a loop; an accepted round is the accepted example.
+        current = result.rounds[-1]
+        key = (result.sample.ref_id, current.number)
         row = {
-            "id": identifier,
             "run_id": self.run_id,
-            "sample_id": str(result.sample.sample_id),
-            "attempt_number": attempt.number,
-            "referring_expression": attempt.candidate.referring_expression
-            if attempt.candidate
+            "ref_id": result.sample.ref_id,
+            "round_number": current.number,
+            "referring_expression": current.candidate.referring_expression
+            if current.candidate
             else None,
-            "weak_bbox_2d": attempt.weak.bbox.as_xyxy() if attempt.weak else None,
-            "strong_bbox_2d": attempt.strong.bbox.as_xyxy() if attempt.strong else None,
-            "weak_iou": attempt.weak_iou,
-            "strong_iou": attempt.strong_iou,
+            "weak_bbox_2d": current.weak.bbox.as_xyxy() if current.weak else None,
+            "strong_bbox_2d": current.strong.bbox.as_xyxy() if current.strong else None,
+            "weak_iou": current.weak_iou,
+            "strong_iou": current.strong_iou,
             "status": status,
-            "feedback": result.error if status == "error" else attempt.feedback,
-            "attempt_file_id": attempt_file_id,
+            "feedback": result.error if status == "error" else current.feedback,
+            "preview_file_id": preview_file_id,
         }
-        if self.saved_attempts.get(identifier) != row:
+        if self.saved_rounds.get(key) != row:
             _execute(
-                self.client.table("attempts").upsert(row, on_conflict="id"), "save the attempt"
+                self.client.table("rounds").upsert(row, on_conflict="run_id,ref_id,round_number"),
+                "save the round",
             )
-            self.saved_attempts[identifier] = row
+            self.saved_rounds[key] = row
 
     def finish(self, status: str) -> None:
         _execute(
@@ -214,21 +211,22 @@ class SupabaseStore:
             "finish the run",
         )
 
-    def iter_outputs(self, run_id: str) -> Iterator[OutputRecord]:
-        # Filter through attempts, keeping run_id out of the outputs table.
+    def iter_accepted_examples(self, run_id: str) -> Iterator[AcceptedExample]:
+        # Accepted rounds of one run, joined to their annotation for image, size and box.
         offset = 0
         while True:
             rows = _execute(
-                self.client.table("outputs")
-                .select(f"{OUTPUT_FIELDS},attempts!inner(run_id)")
-                .eq("attempts.run_id", run_id)
-                .order("attempt_id")
+                self.client.table("rounds")
+                .select(ACCEPTED_FIELDS)
+                .eq("run_id", run_id)
+                .eq("status", "accepted")
+                .order("ref_id")
+                .order("round_number")
                 .range(offset, offset + PAGE_SIZE - 1),
-                "read outputs",
+                "read accepted examples",
             ).data
             for row in rows:
-                row.pop("attempts", None)
-                yield OutputRecord.model_validate(row)
+                yield AcceptedExample.from_round_row(row)
             if len(rows) < PAGE_SIZE:
                 return
             offset += len(rows)

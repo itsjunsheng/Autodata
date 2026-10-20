@@ -1,17 +1,26 @@
 from io import BytesIO
-from uuid import UUID
 
 import pytest
 from PIL import Image
 
-from models import Box, Sample, SampleRecord
+from models import AnnotationRecord, Box, Sample, Settings
+
+TEST_MODELS = {
+    "main_model": "gpt-5.6-luna",
+    "challenger_model": "gpt-5.6-luna",
+    "strong_model": "qwen/qwen3-vl-235b-a22b-instruct",
+    "weak_model": "qwen/qwen3-vl-8b-instruct",
+}
+
+
+def make_settings(**overrides) -> Settings:
+    return Settings(**(TEST_MODELS | overrides))
 
 
 @pytest.fixture
 def sample() -> Sample:
     return Sample(
         ref_id=1,
-        sample_id=UUID("00000000-0000-0000-0000-000000000001"),
         image_file_id="original-image",
         width=200,
         height=100,
@@ -33,13 +42,14 @@ def image_bytes(image) -> bytes:
 
 
 @pytest.fixture
-def sample_record(sample) -> SampleRecord:
-    return SampleRecord(
-        id=sample.sample_id,
+def sample_record(sample) -> AnnotationRecord:
+    return AnnotationRecord(
         image_file_id=sample.image_file_id,
         width=sample.width,
         height=sample.height,
         bbox_2d=sample.target.as_xyxy(),
         referring_expressions=sample.referring_expressions,
-        dataset="jxu124/refcoco",
+        coco_image_id=20,
+        ref_id=sample.ref_id,
+        category="cup",
     )

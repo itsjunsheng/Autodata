@@ -31,15 +31,15 @@ The paper's settings vary by experiment: Section 3.1, the meta-optimisation setu
 | Challenger | OpenAI VLM creates a referring expression from the main agent's prompt (`challenger.py`) |
 | Referring-expression checks | No semantic review or duplicate filter after generation; candidates go directly to both solvers |
 | Weak solver | The target Qwen3-VL model called through OpenRouter (`weak_solver.py`) |
-| Strong solver | Configurable OpenAI VLM; correctness measured per candidate (`strong_solver.py`) |
+| Strong solver | Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM; correctness measured per candidate (`strong_solver.py`) |
 | Objective evaluator | Python IoU against the unchanged RefCOCO annotation |
 | Verifier implementation | Deterministic IoU calculation and threshold comparison, with no model calls (`verifier.py`) |
 | Execution harness | Python enforces label boundaries, fixed gates, and bounded rounds around the main LLM |
 | Learnings | Main LLM analyses solver boxes, IoUs, and deterministic rejection reasons to issue a new challenger prompt |
 | Final data | Original image, accepted generated referring expression, annotated box in Qwen3-VL format |
-| Trajectories | Supabase stores attempt checkpoints and accepted output rows; Google Drive stores one coloured image per completed/failed attempt |
+| Trajectories | Supabase stores one row per round, with accepted rounds forming the training set; Google Drive stores one coloured image per completed/failed round |
 
-The implementation uses one target per image, one candidate per round, one rollout per solver, at most three rounds, and at most one accepted example per input sample. Each of the five diagram roles has its own module. Four roles make model calls; the verifier is deterministic Python. The main agent performs actual LLM planning/reflection; a small Python harness enforces the workflow and acceptance gates. There is no agent framework, code execution tool, or autonomous edit to scoring code. This is the inner data-creation loop, not the paper's outer meta-optimisation procedure.
+The implementation imports every referred object of each image and uses one candidate per round, one rollout per solver, at most three rounds, and at most one accepted example per input sample. Each of the five diagram roles has its own module. Four roles make model calls; the verifier is deterministic Python. The main agent performs actual LLM planning/reflection; a small Python harness enforces the workflow and acceptance gates. There is no agent framework, code execution tool, or autonomous edit to scoring code. This is the inner data-creation loop, not the paper's outer meta-optimisation procedure.
 
 ## Quality boundaries
 
@@ -51,7 +51,7 @@ The implementation uses one target per image, one candidate per round, one rollo
 - Provider failures, refusals, truncation, and invalid coordinates produce an error, not a successful weak-failure criterion.
 - The final answer comes from RefCOCO, not a potentially imprecise model prediction.
 - Rejected/exhausted targets remain inspectable and are excluded from the training bundle.
-- Generation uses training samples only; source adapters enforce this without a stored split attribute. The ten examples are a workflow pilot, not an evaluation benchmark.
+- Generation uses training samples only; the source adapter enforces training-only without a stored split attribute. The ten examples are a workflow pilot, not an evaluation benchmark.
 
 ## Initial acceptance policy
 
@@ -63,4 +63,4 @@ This is an intentional simplification of the paper's verifier/judge: generated r
 
 ## Later experiments
 
-Once the ten-example loop runs with live endpoints, inspect retained and rejected cases, evaluate the solver gap over repeated attempts, measure diversity, and compare Qwen trained on equal-sized baseline and curated datasets using untouched RefCOCO evaluation splits. Dataset-level strategy learning, training the target model between rounds, and outer scaffold meta-optimisation can follow after that evidence exists.
+Once the ten-example loop runs with live endpoints, inspect retained and rejected cases, evaluate the solver gap over repeated rounds, measure diversity, and compare Qwen trained on equal-sized baseline and curated datasets using untouched RefCOCO evaluation splits. Dataset-level strategy learning, training the target model between rounds, and outer scaffold meta-optimisation can follow after that evidence exists.

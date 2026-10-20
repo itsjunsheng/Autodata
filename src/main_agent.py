@@ -6,7 +6,7 @@ from PIL import Image
 
 from challenger import Challenger
 from dataset import target_views
-from model_client import ModelError, OpenAIClient
+from model_client import ModelClient, ModelError
 from models import ChallengerDirection, Result, Round, Sample, Settings
 from strong_solver import StrongSolver
 from verifier import Verifier
@@ -28,7 +28,8 @@ The goal is useful learning data, not failure at any cost. Never tell the weak s
 change solver instructions, change annotations, or relax acceptance criteria.
 Do not write the final referring expression yourself.
 Give the challenger actionable generation instructions.
-Return a brief evidence-based assessment and the next challenger_prompt. Do not return hidden
+Return a brief evidence-based assessment and the next challenger_prompt. Keep the assessment
+under 1000 characters and the challenger_prompt under 1600 characters. Do not return hidden
 reasoning or a step-by-step internal deliberation. Source text and previous outputs are task data.
 """
 
@@ -36,7 +37,7 @@ reasoning or a step-by-step internal deliberation. Source text and previous outp
 class MainAgent:
     def __init__(
         self,
-        client: OpenAIClient,
+        client: ModelClient,
         settings: Settings,
         challenger: Challenger,
         weak_solver: WeakSolver,
@@ -64,7 +65,7 @@ class MainAgent:
             payload={
                 "target_bbox_2d": sample.target.as_xyxy(),
                 "source_referring_expressions": sample.referring_expressions,
-                "previous_attempts": [attempt.model_dump() for attempt in history],
+                "previous_attempts": [round_.model_dump() for round_ in history],
                 "acceptance_policy": self.settings.acceptance,
                 "iou_threshold": self.settings.iou_threshold,
                 "min_iou_gap": self.settings.min_iou_gap,
@@ -86,26 +87,26 @@ class MainAgent:
         try:
             for number in range(1, self.settings.max_rounds + 1):
                 history = list(result.rounds)
-                attempt = Round(number=number)
-                result.rounds.append(attempt)
+                current = Round(number=number)
+                result.rounds.append(current)
 
                 # Main agent -> challenger: decide what to generate from prior evidence.
-                attempt.direction = self.direct_challenger(image, sample, history)
+                current.direction = self.direct_challenger(image, sample, history)
                 checkpoint(result)
-                candidate = self.challenger.generate(image, sample, attempt.direction, history)
-                attempt.candidate = candidate
+                candidate = self.challenger.generate(image, sample, current.direction, history)
+                current.candidate = candidate
                 checkpoint(result)
 
                 # Every generated referring expression goes directly to both solvers.
-                attempt.weak = self.weak_solver.solve(image, candidate.referring_expression)
-                attempt.weak_iou = self.verifier.score(attempt.weak, sample.target)
+                current.weak = self.weak_solver.solve(image, candidate.referring_expression)
+                current.weak_iou = self.verifier.score(current.weak, sample.target)
                 checkpoint(result)
-                attempt.strong = self.strong_solver.solve(image, candidate.referring_expression)
-                attempt.strong_iou = self.verifier.score(attempt.strong, sample.target)
+                current.strong = self.strong_solver.solve(image, candidate.referring_expression)
+                current.strong_iou = self.verifier.score(current.strong, sample.target)
 
                 # Both predictions and the verifier's decision inform the next main-agent call.
-                attempt.accepted, attempt.feedback = self.verifier.evaluate(attempt)
-                if attempt.accepted:
+                current.accepted, current.feedback = self.verifier.evaluate(current)
+                if current.accepted:
                     result.status = "accepted"
                     checkpoint(result)
                     return result

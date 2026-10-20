@@ -7,13 +7,20 @@ import httplib2
 import pytest
 from googleapiclient.discovery import build
 
-from google_drive import FOLDER_MIME, DriveError, GoogleDrive, create_drive_client
+from google_drive import (
+    FOLDER_MIME,
+    IMAGES_FOLDER,
+    PREVIEWS_FOLDER,
+    DriveError,
+    GoogleDrive,
+    create_drive_client,
+)
 
 
 class MemoryDrive:
     # Run the real Drive SDK against a fake HTTP server, including resumable uploads.
 
-    def __init__(self):
+    def __init__(self, folders=True):
         self.objects = {
             "root-folder": {
                 "id": "root-folder",
@@ -27,14 +34,29 @@ class MemoryDrive:
         self.contents = {}
         self.sessions = {}
         self.requests = []
+        self.folder_creates = []
         self.fail_upload = False
-        self.file_errors = {}
+        self.list_error = None
         self.list_page_size = 1000
         self.next_id = 1
         self.service = build("drive", "v3", http=self, static_discovery=True, cache_discovery=False)
         self.drive = GoogleDrive(self.service, "root-folder")
+        if folders:
+            for name in (IMAGES_FOLDER, PREVIEWS_FOLDER):
+                self.put_folder(name)
 
-    def put_original(self, file_id, content, name="sample 1.png"):
+    def put_folder(self, name):
+        folder_id = self.new_id("folder")
+        self.objects[folder_id] = {
+            "id": folder_id,
+            "name": name,
+            "mimeType": FOLDER_MIME,
+            "parents": ["root-folder"],
+            "trashed": False,
+        }
+        return folder_id
+
+    def put_original(self, file_id, content, name="20.png"):
         self.objects[file_id] = {
             "id": file_id,
             "name": name,
@@ -89,23 +111,19 @@ class MemoryDrive:
             self.sessions[file_id] = metadata
             return self.response({}, location=f"https://upload.example/session/{file_id}")
         if parsed.path == "/drive/v3/files" and method == "GET":
+            if self.list_error:
+                return self.response(
+                    {"error": {"message": "private server body"}}, status=self.list_error
+                )
             query = params["q"][0]
             parent = re.search(r"'([^']+)' in parents", query)[1]
             match = re.search(r"name = '(.*)' and trashed", query)
             name = match[1].replace("\\'", "'").replace("\\\\", "\\") if match else None
-            source_match = re.search(
-                r"properties has \{ key='autodata_source' and value='(.*)' \}", query
-            )
-            source_key = source_match[1] if source_match else None
             files = [
                 value
                 for value in self.objects.values()
                 if parent in value.get("parents", [])
                 and (name is None or value["name"] == name)
-                and (
-                    source_key is None
-                    or value.get("properties", {}).get("autodata_source") == source_key
-                )
                 and not value.get("trashed")
             ]
             offset = int(params.get("pageToken", ["0"])[0])
@@ -115,15 +133,13 @@ class MemoryDrive:
                 response["nextPageToken"] = str(offset + limit)
             return self.response(response)
         if parsed.path == "/drive/v3/files" and method == "POST":
-            metadata = json.loads(body)
-            file_id = self.new_id("folder")
-            self.objects[file_id] = {**metadata, "id": file_id, "trashed": False}
-            return self.response({"id": file_id})
+            self.folder_creates.append(json.loads(body))
+            return self.response({"error": {"message": "unexpected create"}}, status=500)
         file_id = parsed.path.rsplit("/", 1)[-1]
-        if file_id not in self.objects or file_id in self.file_errors:
+        if file_id not in self.objects:
             return self.response(
                 {"error": {"message": "private server body"}},
-                status=self.file_errors.get(file_id, 404),
+                status=404,
             )
         if method == "PATCH":
             self.objects[file_id].update(json.loads(body))
@@ -138,104 +154,77 @@ class MemoryDrive:
 def test_drive_check_is_read_only():
     memory = MemoryDrive()
     assert memory.drive.check_connection()["folder_name"] == "Autodata"
-    assert len(memory.objects) == 1
+    assert len(memory.objects) == 3
     assert all(method == "GET" for method, _ in memory.requests)
+
+
+def test_check_returns_both_folder_ids():
+    memory = MemoryDrive()
+    ids = {value["name"]: key for key, value in memory.objects.items() if key != "root-folder"}
+    assert memory.drive.check_connection()["folders"] == {
+        "images": ids["images"],
+        "previews": ids["previews"],
+    }
+
+
+def test_missing_folder_is_reported_and_never_created():
+    memory = MemoryDrive(folders=False)
+    with pytest.raises(DriveError, match="'images'"):
+        memory.drive.check_connection()
+    assert memory.folder_creates == []
+    assert all(method == "GET" for method, _ in memory.requests)
+    assert len(memory.objects) == 1
 
 
 def test_original_is_uploaded_once_and_round_trips_exact_bytes(image_bytes):
     memory = MemoryDrive()
-    path = "samples/image-hash.png"
-    first = memory.drive.upload(path, image_bytes, "image/png", immutable=True)
-    second = memory.drive.upload(path, image_bytes, "image/png", immutable=True)
+    name = "20.png"
+    first = memory.drive.upload_image(name, image_bytes, "image/png")
+    second = memory.drive.upload_image(name, image_bytes, "image/png")
     another_client = GoogleDrive(
         build("drive", "v3", http=memory, static_discovery=True, cache_discovery=False),
         "root-folder",
     )
-    assert another_client.upload(path, image_bytes, "image/png", immutable=True) == first
+    assert another_client.upload_image(name, image_bytes, "image/png") == first
+    assert another_client.find_image(name) == first
     assert first == second
     assert memory.drive.download(first) == image_bytes
     assert sum(method == "PUT" for method, _ in memory.requests) == 1
-    assert len([v for v in memory.objects.values() if v.get("mimeType") == FOLDER_MIME]) == 2
+    assert len([v for v in memory.objects.values() if v.get("mimeType") == FOLDER_MIME]) == 3
 
 
-def test_attempt_updates_keep_one_file_id():
+def test_round_updates_keep_one_file_id():
     memory = MemoryDrive()
-    path = "attempts/run-1/sample 1 attempt 1.png"
-    first = memory.drive.upload(path, b"first", "image/png")
-    second = memory.drive.upload(path, b"second", "image/png")
+    name = "run-1 ref 0 round 1.png"
+    first = memory.drive.upload(PREVIEWS_FOLDER, name, b"first", "image/png")
+    second = memory.drive.upload(PREVIEWS_FOLDER, name, b"second", "image/png")
     assert first == second
     assert memory.drive.download(second) == b"second"
     assert sum(method == "PUT" for method, _ in memory.requests) == 2
 
 
-def test_sample_numbers_survive_new_clients_and_repeated_imports():
+def test_find_image_returns_none_for_unknown_name_and_file_id_for_known_one():
     memory = MemoryDrive()
-    first = memory.drive.upload_sample(b"first image", "image/jpeg", source_key="coco:train2014:1")
-    second = memory.drive.upload_sample(
-        b"second image", "image/jpeg", source_key="coco:train2014:2"
-    )
-    another_client = GoogleDrive(memory.service, "root-folder")
-    assert (
-        another_client.upload_sample(b"second image", "image/jpeg", source_key="coco:train2014:2")
-        == second
-    )
-    third = another_client.upload_sample(
-        b"third image", "image/jpeg", source_key="coco:train2014:3"
-    )
-    assert (
-        another_client.upload_sample(b"first image", "image/jpeg", source_key="coco:train2014:1")
-        == first
-    )
-    assert [memory.objects[file_id]["name"] for file_id in (first, second, third)] == [
-        "sample 1.jpg",
-        "sample 2.jpg",
-        "sample 3.jpg",
-    ]
-    assert another_client.sample_name(second) == "sample 2"
-    assert sum(method == "PUT" for method, _ in memory.requests) == 3
-
-
-def test_numbering_reads_all_pages_and_keeps_legacy_file_ids():
-    memory = MemoryDrive()
-    first = memory.drive.upload("samples/sample 1.jpg", b"first", "image/jpeg", immutable=True)
-    last = memory.drive.upload("samples/sample 9.jpg", b"last", "image/jpeg", immutable=True)
-    legacy = memory.drive.upload("samples/old-hash.jpg", b"legacy", "image/jpeg", immutable=True)
-    memory.list_page_size = 1
-    assert memory.drive.sample_name(legacy) == "sample 10"
-    assert (
-        memory.drive.upload_sample(b"legacy", "image/jpeg", source_key="coco:train2014:10")
-        == legacy
-    )
-    new = memory.drive.upload_sample(b"new", "image/jpeg", source_key="coco:train2014:11")
-    assert memory.objects[new]["name"] == "sample 11.jpg"
-    assert memory.contents[legacy] == b"legacy"
-    assert memory.objects[first]["name"] == "sample 1.jpg"
-    assert memory.objects[last]["name"] == "sample 9.jpg"
-
-
-def test_sample_upload_failure_does_not_consume_a_number():
-    memory = MemoryDrive()
-    memory.fail_upload = True
-    with pytest.raises(DriveError):
-        memory.drive.upload_sample(b"first", "image/jpeg", source_key="coco:train2014:1")
-    memory.fail_upload = False
-    file_id = memory.drive.upload_sample(b"first", "image/jpeg", source_key="coco:train2014:1")
-    assert memory.objects[file_id]["name"] == "sample 1.jpg"
+    assert memory.drive.find_image("20.jpg") is None
+    file_id = memory.drive.upload_image("20.jpg", b"jpeg", "image/jpeg")
+    assert memory.drive.find_image("20.jpg") == file_id
+    assert memory.drive.find_image("21.jpg") is None
 
 
 def test_original_with_wrong_content_is_never_overwritten():
     memory = MemoryDrive()
-    file_id = memory.drive.upload("samples/hash.jpg", b"original", "image/jpeg", immutable=True)
+    name = "20.jpg"
+    file_id = memory.drive.upload_image(name, b"original", "image/jpeg")
     with pytest.raises(DriveError, match="differs"):
-        memory.drive.upload("samples/hash.jpg", b"changed", "image/jpeg", immutable=True)
+        memory.drive.upload_image(name, b"changed", "image/jpeg")
     assert memory.contents[file_id] == b"original"
 
 
-@pytest.mark.parametrize("path", ["../outside.png", "/outside.png", r"samples\bad.png"])
-def test_bad_paths_are_rejected_without_requests(path):
+@pytest.mark.parametrize("name", ["", "../outside.png", "/outside.png", r"images\bad.png"])
+def test_bad_names_are_rejected_without_requests(name):
     memory = MemoryDrive()
-    with pytest.raises(DriveError, match="relative"):
-        memory.drive.upload(path, b"data", "image/png")
+    with pytest.raises(DriveError, match="names"):
+        memory.drive.upload(IMAGES_FOLDER, name, b"data", "image/png")
     assert memory.requests == []
 
 
@@ -243,7 +232,7 @@ def test_upload_errors_do_not_expose_google_server_bodies():
     memory = MemoryDrive()
     memory.fail_upload = True
     with pytest.raises(DriveError) as error:
-        memory.drive.upload("attempts/run/attempt.png", b"data", "image/png")
+        memory.drive.upload(PREVIEWS_FOLDER, "run round.png", b"data", "image/png")
     assert "HTTP 403" in str(error.value)
     assert "secret server body" not in str(error.value)
 

@@ -4,16 +4,18 @@ from io import BytesIO
 
 import httpx
 import pytest
+from conftest import make_settings
 from openai import OpenAI
 from PIL import Image
+from pydantic import ValidationError
 
 from challenger import Challenger
 from main_agent import MainAgent
-from model_client import ModelError, OpenAIClient
-from models import Settings
+from model_client import OPENROUTER_BASE_URL, ModelError, OpenAIClient, OpenRouterClient
+from models import Candidate, ChallengerDirection, GroundingAnswer, Settings
 from strong_solver import SOLVER, StrongSolver
 from verifier import Verifier
-from weak_solver import OPENROUTER_BASE_URL, WeakSolver
+from weak_solver import WeakSolver
 
 
 def response_body(text, status="completed"):
@@ -47,7 +49,7 @@ def chat_body(text, finish="stop"):
         "id": "chat_test",
         "object": "chat.completion",
         "created": 0,
-        "model": Settings().weak_model,
+        "model": make_settings().weak_model,
         "choices": [
             {
                 "index": 0,
@@ -62,7 +64,7 @@ def catalog_body(model_id=None, modalities=None, parameters=None):
     return {
         "data": [
             {
-                "id": model_id or Settings().weak_model,
+                "id": model_id or make_settings().weak_model,
                 "architecture": {"input_modalities": modalities or ["text", "image"]},
                 "supported_parameters": parameters or ["response_format", "structured_outputs"],
             }
@@ -88,9 +90,12 @@ def test_real_sdk_requests_keep_labels_and_marked_images_away_from_solvers(image
         body = chat_body(text) if request.url.host == "openrouter.ai" else response_body(text)
         return httpx.Response(200, json=body)
 
-    settings = Settings()
+    settings = make_settings()
     client = OpenAIClient(settings, client=mock_client(respond))
-    weak_solver = WeakSolver(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
+    weak_solver = WeakSolver(
+        OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL)),
+        settings.weak_model,
+    )
     strong_solver = StrongSolver(client, settings.strong_model)
     weak = weak_solver.solve(image, "cup beside the plate")
     strong = strong_solver.solve(image, "cup beside the plate")
@@ -115,8 +120,8 @@ def test_real_sdk_requests_keep_labels_and_marked_images_away_from_solvers(image
 @pytest.mark.parametrize("text", ['{"bbox_2d":[900,200,100,800]}', '{"bbox_2d":[0,0,2000,900]}'])
 def test_openai_rejects_invalid_model_boxes(image, text):
     client = mock_client(lambda _: httpx.Response(200, json=response_body(text)))
-    transport = OpenAIClient(Settings(), client=client)
-    solver = StrongSolver(transport, Settings().strong_model)
+    transport = OpenAIClient(make_settings(), client=client)
+    solver = StrongSolver(transport, make_settings().strong_model)
     with pytest.raises(ModelError, match="invalid structured"):
         solver.solve(image, "cup")
 
@@ -124,9 +129,11 @@ def test_openai_rejects_invalid_model_boxes(image, text):
 def test_openai_refusal_is_not_scored(image):
     body = response_body("")
     body["output"][0]["content"] = [{"type": "refusal", "refusal": "Refused"}]
-    client = OpenAIClient(Settings(), client=mock_client(lambda _: httpx.Response(200, json=body)))
+    client = OpenAIClient(
+        make_settings(), client=mock_client(lambda _: httpx.Response(200, json=body))
+    )
     with pytest.raises(ModelError, match="refused"):
-        StrongSolver(client, Settings().strong_model).solve(image, "cup")
+        StrongSolver(client, make_settings().strong_model).solve(image, "cup")
 
 
 @pytest.mark.parametrize("code", ["rate_limit_exceeded", "insufficient_quota", "slow_down"])
@@ -151,7 +158,7 @@ def test_openai_429_reports_model_code_and_safe_rate_headers(image, code):
             },
         )
 
-    transport = OpenAIClient(Settings(), client=mock_client(respond))
+    transport = OpenAIClient(make_settings(), client=mock_client(respond))
     with pytest.raises(ModelError) as caught:
         StrongSolver(transport, "gpt-5.6-luna").solve(image, "cup")
     message = str(caught.value)
@@ -178,8 +185,10 @@ def test_openrouter_uses_vision_chat_api_and_json_schema(image, sample):
         requests.append(json.loads(request.content))
         return httpx.Response(200, json=chat_body('{"bbox_2d":[100,200,500,800]}'))
 
-    solver = WeakSolver(Settings(), client=mock_client(respond, OPENROUTER_BASE_URL))
-    solver.check_connection()
+    settings = make_settings()
+    router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
+    router.check_model(settings.weak_model, "weak_solver")
+    solver = WeakSolver(router, settings.weak_model)
     prediction = solver.solve(image, "cup on the table")
     assert prediction.bbox == sample.target
     request = requests[0]
@@ -198,10 +207,10 @@ def test_openrouter_uses_vision_chat_api_and_json_schema(image, sample):
 def test_qwen_credentials_are_separate(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "router-test-secret")
-    solver = WeakSolver(Settings())
-    assert solver.client.api_key == "router-test-secret"
-    assert str(solver.client.base_url) == OPENROUTER_BASE_URL + "/"
-    solver.client.close()
+    router = OpenRouterClient(make_settings())
+    assert router.client.api_key == "router-test-secret"
+    assert str(router.client.base_url) == OPENROUTER_BASE_URL + "/"
+    router.client.close()
 
 
 @pytest.mark.parametrize("key", ["", "EMPTY", "your-openrouter-key"])
@@ -209,7 +218,7 @@ def test_openrouter_key_required_even_with_openai_key(monkeypatch, key):
     monkeypatch.setenv("OPENAI_API_KEY", "openai-test-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", key)
     with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
-        WeakSolver(Settings())
+        OpenRouterClient(make_settings())
 
 
 @pytest.mark.parametrize(
@@ -223,7 +232,9 @@ def test_openrouter_key_required_even_with_openai_key(monkeypatch, key):
 def test_openrouter_rejects_incompatible_models(catalog, message):
     client = mock_client(lambda _: httpx.Response(200, json=catalog), OPENROUTER_BASE_URL)
     with pytest.raises(ModelError, match=message):
-        WeakSolver(Settings(), client=client).check_connection()
+        OpenRouterClient(make_settings(), client=client).check_model(
+            make_settings().weak_model, "weak_solver"
+        )
 
 
 def test_openrouter_api_failure_is_not_a_weak_solver_failure(image):
@@ -232,7 +243,9 @@ def test_openrouter_api_failure_is_not_a_weak_solver_failure(image):
         OPENROUTER_BASE_URL,
     )
     with pytest.raises(ModelError, match="credits"):
-        WeakSolver(Settings(), client=client).solve(image, "cup")
+        WeakSolver(
+            OpenRouterClient(make_settings(), client=client), make_settings().weak_model
+        ).solve(image, "cup")
 
 
 def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sample):
@@ -258,8 +271,11 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
     def qwen_response(request):
         return httpx.Response(200, json=chat_body('{"bbox_2d":[700,100,900,300]}'))
 
-    settings = Settings()
-    weak = WeakSolver(settings, client=mock_client(qwen_response, OPENROUTER_BASE_URL))
+    settings = make_settings()
+    weak = WeakSolver(
+        OpenRouterClient(settings, client=mock_client(qwen_response, OPENROUTER_BASE_URL)),
+        settings.weak_model,
+    )
     client = OpenAIClient(settings, client=mock_client(openai_response))
     main_agent = MainAgent(
         client,
@@ -284,9 +300,163 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
 )
 def test_qwen_invalid_or_truncated_answer_is_an_error(image, finish, content):
     body = chat_body(content, finish)
+    settings = make_settings()
     solver = WeakSolver(
-        Settings(),
-        client=mock_client(lambda _: httpx.Response(200, json=body), OPENROUTER_BASE_URL),
+        OpenRouterClient(
+            settings,
+            client=mock_client(lambda _: httpx.Response(200, json=body), OPENROUTER_BASE_URL),
+        ),
+        settings.weak_model,
     )
     with pytest.raises(ModelError):
         solver.solve(image, "cup")
+
+
+def test_strong_solver_on_openrouter_uses_chat_api_with_strong_model(image, sample):
+    requests = []
+
+    def respond(request):
+        assert str(request.url) == OPENROUTER_BASE_URL + "/chat/completions"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=chat_body('{"bbox_2d":[100,200,500,800]}'))
+
+    settings = make_settings(strong_provider="openrouter")
+    router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
+    prediction = StrongSolver(router, settings.strong_model).solve(image, "cup")
+    assert prediction.bbox == sample.target
+    request = requests[0]
+    assert request["model"] == "qwen/qwen3-vl-235b-a22b-instruct"
+    assert request["messages"][0]["content"] == SOLVER
+    assert json.loads(request["messages"][1]["content"][0]["text"]) == {
+        "referring_expression": "cup"
+    }
+
+
+def test_openai_preflight_rejects_openrouter_model_id_before_generation():
+    model = "qwen/qwen3-vl-235b-a22b-instruct"
+
+    def respond(request):
+        if request.method == "POST":
+            pytest.fail("Pre-flight must not make a generation call")
+        assert request.url.path == f"/v1/models/{model}"
+        error = {"message": "not found", "type": "invalid_request_error", "code": "model_not_found"}
+        return httpx.Response(404, json={"error": error})
+
+    client = OpenAIClient(make_settings(), client=mock_client(respond))
+    with pytest.raises(ModelError) as raised:
+        client.check_model(model, "strong_solver")
+    assert model in str(raised.value)
+    assert "AUTODATA_STRONG_PROVIDER" in str(raised.value)
+
+
+def test_openrouter_catalogue_checked_once_for_both_solvers():
+    settings = make_settings()
+    methods = []
+    catalogue = catalog_body(settings.weak_model)
+    catalogue["data"] += catalog_body(settings.strong_model)["data"]
+
+    def respond(request):
+        methods.append(request.method)
+        return httpx.Response(200, json=catalogue)
+
+    router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
+    router.check_model(settings.weak_model, "weak_solver")
+    router.check_model(settings.strong_model, "strong_solver")
+    assert methods == ["GET"]
+
+
+def test_openai_preflight_reports_auth_failure_without_blaming_the_model_id():
+    def respond(request):
+        assert request.method == "GET"
+        error = {"message": "bad key", "type": "invalid_request_error", "code": "invalid_api_key"}
+        return httpx.Response(401, json={"error": error})
+
+    client = OpenAIClient(make_settings(), client=mock_client(respond))
+    with pytest.raises(ModelError) as raised:
+        client.check_model("gpt-5.4-nano", "main_agent")
+    message = str(raised.value)
+    assert "HTTP 401" in message and "main_agent" in message
+    assert "does not offer" not in message
+
+
+# Keywords OpenAI accepts in a strict response schema; anything else is rejected with HTTP 400.
+STRICT_SCHEMA_KEYWORDS = {
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "const",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "title",
+    "description",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minItems",
+    "maxItems",
+    "pattern",
+    "format",
+}
+
+
+def schema_keywords(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in {"properties", "$defs"}:
+                for child in value.values():
+                    yield from schema_keywords(child)
+            else:
+                yield key
+                yield from schema_keywords(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from schema_keywords(item)
+
+
+@pytest.mark.parametrize("schema", [GroundingAnswer, Candidate, ChallengerDirection])
+def test_response_schemas_use_only_openai_strict_keywords(schema):
+    unsupported = set(schema_keywords(schema.model_json_schema())) - STRICT_SCHEMA_KEYWORDS
+    assert unsupported == set()
+
+
+@pytest.mark.parametrize("value", ["", "   ", "x" * 401])
+def test_candidate_text_limits_still_apply_after_parsing(value):
+    with pytest.raises(ValidationError):
+        Candidate(referring_expression=value, strategy="relation")
+    assert (
+        len(Candidate(referring_expression="x" * 400, strategy="relation").referring_expression)
+        == 400
+    )
+
+
+def test_direction_text_limits_still_apply_after_parsing():
+    with pytest.raises(ValidationError):
+        ChallengerDirection(assessment="x" * 1001, challenger_prompt="ok")
+    with pytest.raises(ValidationError):
+        ChallengerDirection(assessment="ok", challenger_prompt="x" * 1601)
+
+
+def test_model_ids_come_from_env_with_no_defaults(monkeypatch):
+    names = [
+        "AUTODATA_MAIN_MODEL",
+        "AUTODATA_CHALLENGER_MODEL",
+        "AUTODATA_STRONG_MODEL",
+        "AUTODATA_WEAK_MODEL",
+    ]
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AUTODATA_MAIN_MODEL", "gpt-5.6-luna")
+    with pytest.raises(ValueError) as raised:
+        Settings.from_env()
+    assert "AUTODATA_CHALLENGER_MODEL" in str(raised.value)
+    assert "AUTODATA_MAIN_MODEL" not in str(raised.value)
+    for name in names:
+        monkeypatch.setenv(name, "model-" + name.lower())
+    settings = Settings.from_env(max_rounds=1)
+    assert settings.weak_model == "model-autodata_weak_model" and settings.max_rounds == 1
