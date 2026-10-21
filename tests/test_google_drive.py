@@ -8,6 +8,7 @@ import pytest
 from googleapiclient.discovery import build
 
 from google_drive import (
+    ACCEPTED_FOLDER,
     FOLDER_MIME,
     IMAGES_FOLDER,
     PREVIEWS_FOLDER,
@@ -36,13 +37,14 @@ class MemoryDrive:
         self.requests = []
         self.folder_creates = []
         self.fail_upload = False
+        self.fail_transport = 0
         self.list_error = None
         self.list_page_size = 1000
         self.next_id = 1
         self.service = build("drive", "v3", http=self, static_discovery=True, cache_discovery=False)
         self.drive = GoogleDrive(self.service, "root-folder")
         if folders:
-            for name in (IMAGES_FOLDER, PREVIEWS_FOLDER):
+            for name in (IMAGES_FOLDER, PREVIEWS_FOLDER, ACCEPTED_FOLDER):
                 self.put_folder(name)
 
     def put_folder(self, name):
@@ -82,6 +84,9 @@ class MemoryDrive:
         parsed = urlparse(uri)
         params = parse_qs(parsed.query)
         self.requests.append((method, uri))
+        if self.fail_transport:
+            self.fail_transport -= 1
+            raise OSError("connection reset by peer")
         if parsed.hostname == "upload.example":
             assert method == "PUT"
             file_id = parsed.path.rsplit("/", 1)[-1]
@@ -159,7 +164,7 @@ class MemoryDrive:
 def test_drive_check_is_read_only():
     memory = MemoryDrive()
     assert memory.drive.check_connection()["folder_name"] == "Autodata"
-    assert len(memory.objects) == 3
+    assert len(memory.objects) == 4
     assert all(method == "GET" for method, _ in memory.requests)
 
 
@@ -169,6 +174,7 @@ def test_check_returns_both_folder_ids():
     assert memory.drive.check_connection()["folders"] == {
         "images": ids["images"],
         "previews": ids["previews"],
+        "accepted": ids["accepted"],
     }
 
 
@@ -195,14 +201,16 @@ def test_original_is_uploaded_once_and_round_trips_exact_bytes(image_bytes):
     assert first == second
     assert memory.drive.download(first) == image_bytes
     assert sum(method == "PUT" for method, _ in memory.requests) == 1
-    assert len([v for v in memory.objects.values() if v.get("mimeType") == FOLDER_MIME]) == 3
+    assert len([v for v in memory.objects.values() if v.get("mimeType") == FOLDER_MIME]) == 4
 
 
 def test_round_updates_keep_one_file_id():
     memory = MemoryDrive()
     name = "run-1 ref 0 round 1.png"
-    first = memory.drive.upload(PREVIEWS_FOLDER, name, b"first", "image/png")
-    second = memory.drive.upload(PREVIEWS_FOLDER, name, b"second", "image/png")
+    first = memory.drive.upload(memory.drive._folder(PREVIEWS_FOLDER), name, b"first", "image/png")
+    second = memory.drive.upload(
+        memory.drive._folder(PREVIEWS_FOLDER), name, b"second", "image/png"
+    )
     assert first == second
     assert memory.drive.download(second) == b"second"
     assert sum(method == "PUT" for method, _ in memory.requests) == 2
@@ -237,7 +245,9 @@ def test_upload_errors_do_not_expose_google_server_bodies():
     memory = MemoryDrive()
     memory.fail_upload = True
     with pytest.raises(DriveError) as error:
-        memory.drive.upload(PREVIEWS_FOLDER, "run round.png", b"data", "image/png")
+        memory.drive.upload(
+            memory.drive._folder(PREVIEWS_FOLDER), "run round.png", b"data", "image/png"
+        )
     assert "HTTP 403" in str(error.value)
     assert "secret server body" not in str(error.value)
 
@@ -329,10 +339,34 @@ def test_failed_oauth_login_does_not_print_provider_details(tmp_path, monkeypatc
 
 def test_run_folder_is_created_once_inside_previews_and_reused_on_resume():
     memory = MemoryDrive()
-    first = memory.drive.run_folder("run-1")
-    again = GoogleDrive(memory.service, "root-folder").run_folder("run-1")
+    first = memory.drive.run_folder(PREVIEWS_FOLDER, "run-1")
+    again = GoogleDrive(memory.service, "root-folder").run_folder(PREVIEWS_FOLDER, "run-1")
     assert first == again
     assert len(memory.folder_creates) == 1
     created = memory.objects[first]
     assert created["name"] == "run-1" and created["mimeType"] == FOLDER_MIME
     assert memory.objects[created["parents"][0]]["name"] == PREVIEWS_FOLDER
+
+
+def test_dropped_connection_is_retried_then_the_upload_succeeds(drive_waits):
+    memory = MemoryDrive()
+    memory.fail_transport = 1
+    file_id = memory.drive.upload_image("20.png", b"png-bytes", "image/png")
+    assert memory.contents[file_id] == b"png-bytes"
+    assert drive_waits == [2]
+
+
+def test_persistent_dropped_connection_reports_attempts_without_server_details(drive_waits):
+    memory = MemoryDrive()
+    memory.fail_transport = 10
+    with pytest.raises(DriveError, match="OSError after 3 attempts"):
+        memory.drive.upload_image("20.png", b"png-bytes", "image/png")
+    assert drive_waits == [2, 5]
+
+
+def test_download_retries_a_dropped_connection(drive_waits):
+    memory = MemoryDrive()
+    memory.put_original("file-1", b"original")
+    memory.fail_transport = 1
+    assert memory.drive.download("file-1") == b"original"
+    assert drive_waits == [2]

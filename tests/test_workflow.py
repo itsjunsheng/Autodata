@@ -12,7 +12,7 @@ from test_supabase import MemorySupabase
 
 import dataset
 from dataset import DatasetError
-from google_drive import DriveError
+from google_drive import ACCEPTED_FOLDER, DriveError
 from main import main, role_models, run_batch
 from model_client import ModelError
 from models import Claim, Prediction, Verdict
@@ -73,6 +73,16 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     preview = cloud.objects[row["preview_file_id"]]
     assert preview["name"] == "ref 1 round 1.png"
     assert cloud.objects[preview["parents"][0]]["name"] == store.run_id
+    copies = [
+        value
+        for value in cloud.objects.values()
+        if value.get("name") == preview["name"] and value["id"] != preview["id"]
+    ]
+    assert len(copies) == 1
+    run_folder = cloud.objects[copies[0]["parents"][0]]
+    assert run_folder["name"] == store.run_id
+    assert cloud.objects[run_folder["parents"][0]]["name"] == ACCEPTED_FOLDER
+    assert cloud.contents[copies[0]["id"]] == cloud.contents[preview["id"]]
     with Image.open(BytesIO(cloud.contents[row["preview_file_id"]])) as preview:
         left = (preview.width - sample.width) // 2
         marked = preview.crop(
@@ -83,7 +93,7 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
         assert marked.getpixel((40, 20)) == (0, 0, 255)
     assert memory.tables["runs"][store.run_id]["status"] == "completed"
     assert memory.tables["runs"][store.run_id]["finished_at"]
-    assert sum(method == "PUT" for method, _ in cloud.requests) == 1
+    assert sum(method == "PUT" for method, _ in cloud.requests) == 2  # preview and accepted copy
     folders = [
         row
         for row in cloud.objects.values()
@@ -92,6 +102,7 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     assert {row["name"] for row in folders if row.get("parents") == ["root-folder"]} == {
         "images",
         "previews",
+        "accepted",
     }
     training_dir = tmp_path / "training"
     assert export_training(store, cloud.drive, [store.run_id], training_dir) == 1
@@ -157,7 +168,9 @@ def test_judge_rejecting_every_round_saves_rejected_rows_and_exhausts(
     memory, cloud, store = cloud_for(sample_record, image_bytes)
     roles = ScriptedRoles(sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=2))
     roles.verdict = Verdict(
-        claims=[Claim(claim="purple apple", visible=False)], other_matches=0, reason="Red apple."
+        claims=[Claim(claim="purple apple", evidence="seen", target="contradicted")],
+        also_fits=[],
+        reason="Red apple.",
     )
     summary = run_batch(store.iter_samples(1), 1, roles.main, store, cloud.drive)
     assert summary["exhausted"] == 1

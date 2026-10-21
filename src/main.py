@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from challenger import Challenger
 from dataset import load_image
 from google_drive import (
+    ACCEPTED_FOLDER,
+    PREVIEWS_FOLDER,
     DriveError,
     GoogleDrive,
     authenticate_drive,
@@ -57,7 +59,7 @@ def run_batch(
     print(f"Supabase run ID: {store.run_id}", flush=True)
     try:
         store.start(main_agent.settings, offset, requested)
-        previews = drive.run_folder(store.run_id)
+        previews = drive.run_folder(PREVIEWS_FOLDER, store.run_id)
         for sample in samples:
             if sample.ref_id in done:
                 skipped += 1
@@ -88,12 +90,12 @@ def run_batch(
                     preview = render_round_preview(image, sample, latest, status)
                     buffer = BytesIO()
                     preview.save(buffer, format="PNG")
-                    file_id = drive.upload(
-                        previews,
-                        f"ref {sample.ref_id} round {latest.number}.png",
-                        buffer.getvalue(),
-                        "image/png",
-                    )
+                    name = f"ref {sample.ref_id} round {latest.number}.png"
+                    file_id = drive.upload(previews, name, buffer.getvalue(), "image/png")
+                    if status == "accepted":
+                        # A second copy for auditing by hand, in accepted/<run id>/.
+                        accepted = drive.run_folder(ACCEPTED_FOLDER, store.run_id)
+                        drive.upload(accepted, name, buffer.getvalue(), "image/png")
                     store.save_round(result, status, file_id)
                     completed_rounds.add(latest.number)
                     print(f"  Round {latest.number}: {status}", flush=True)

@@ -1,12 +1,13 @@
 # Authenticate with Google; store originals in images/ and round previews in previews/ in Drive.
-# The user creates images/ and previews/ by hand; the code creates only one folder per run
-# inside previews/.
+# The user creates images/, previews/ and accepted/ by hand; the code creates only one folder
+# per run inside previews/ and accepted/.
 
 import hashlib
 import os
 import re
 from io import BytesIO
 from pathlib import Path
+from time import sleep
 
 import httplib2
 from google.auth.exceptions import GoogleAuthError
@@ -24,12 +25,28 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 IMAGES_FOLDER = "images"
 PREVIEWS_FOLDER = "previews"
+ACCEPTED_FOLDER = "accepted"
 IMAGE_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+RETRY_DELAYS = (2, 5)  # seconds before the second and third attempt of a dropped request
 
 
 class DriveError(RuntimeError):
     # A Drive failure with a message safe to print.
     pass
+
+
+def _retry_transport(action, operation: str):
+    # Retry a call that failed below HTTP: a dropped connection, a timeout, or a token refresh.
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            return action()
+        except (GoogleAuthError, OSError, httplib2.HttpLib2Error) as error:
+            if delay is None:
+                raise DriveError(
+                    f"Google Drive {operation} failed ({type(error).__name__} after "
+                    f"{len(RETRY_DELAYS) + 1} attempts). Check authentication and connectivity."
+                ) from error
+            sleep(delay)
 
 
 def validate_file_id(value: str) -> str:
@@ -113,15 +130,11 @@ class GoogleDrive:
 
     def _execute(self, request):
         try:
-            return request.execute(num_retries=2)
+            return _retry_transport(lambda: request.execute(num_retries=2), "request")
         except HttpError as error:
             raise DriveError(
                 f"Google Drive request failed (HTTP {error.resp.status}). "
                 "Check account permissions, available storage, and API quotas."
-            ) from error
-        except (GoogleAuthError, OSError, httplib2.HttpLib2Error) as error:
-            raise DriveError(
-                "Google Drive request failed. Check authentication and connectivity."
             ) from error
 
     def check_connection(self) -> dict:
@@ -141,7 +154,10 @@ class GoogleDrive:
             "connected": True,
             "folder_id": self.folder_id,
             "folder_name": folder["name"],
-            "folders": {name: self._folder(name) for name in (IMAGES_FOLDER, PREVIEWS_FOLDER)},
+            "folders": {
+                name: self._folder(name)
+                for name in (IMAGES_FOLDER, PREVIEWS_FOLDER, ACCEPTED_FOLDER)
+            },
         }
 
     def _find(self, parent_id: str, name: str) -> dict | None:
@@ -183,22 +199,24 @@ class GoogleDrive:
             self.folders[name] = validate_file_id(found["id"])
         return self.folders[name]
 
-    def run_folder(self, run_id: str) -> str:
-        # The one folder the code creates: previews/<run id>, reused when a run resumes.
-        parent = self._folder(PREVIEWS_FOLDER)
-        found = self._find(parent, run_id)
-        if found is not None:
-            if found.get("mimeType") != FOLDER_MIME:
-                raise DriveError("A file occupies the run's preview folder name.")
-            return validate_file_id(found["id"])
-        created = self._execute(
-            self.files.create(
-                body={"name": run_id, "parents": [parent], "mimeType": FOLDER_MIME},
-                fields="id",
-                supportsAllDrives=True,
-            )
-        )
-        return validate_file_id(created["id"])
+    def run_folder(self, parent: str, run_id: str) -> str:
+        # The one kind of folder the code creates: <parent>/<run id>, reused when a run resumes.
+        key = f"{parent}/{run_id}"
+        if key not in self.folders:
+            parent_id = self._folder(parent)
+            found = self._find(parent_id, run_id)
+            if found is None:
+                found = self._execute(
+                    self.files.create(
+                        body={"name": run_id, "parents": [parent_id], "mimeType": FOLDER_MIME},
+                        fields="id",
+                        supportsAllDrives=True,
+                    )
+                )
+            elif found.get("mimeType") != FOLDER_MIME:
+                raise DriveError("A file occupies the run's folder name.")
+            self.folders[key] = validate_file_id(found["id"])
+        return self.folders[key]
 
     def upload(
         self, parent: str, name: str, content: bytes, content_type: str, *, immutable: bool = False
@@ -243,16 +261,16 @@ class GoogleDrive:
     def download(self, file_id: str) -> bytes:
         # Read a file into memory, with bounded retries and no disk cache.
         request = self.files.get_media(fileId=validate_file_id(file_id), supportsAllDrives=True)
-        buffer = BytesIO()
-        downloader = MediaIoBaseDownload(buffer, request)
-        try:
+
+        def fetch() -> bytes:
+            buffer = BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
             done = False
             while not done:
                 _, done = downloader.next_chunk(num_retries=2)
+            return buffer.getvalue()
+
+        try:
+            return _retry_transport(fetch, "download")
         except HttpError as error:
             raise DriveError(f"Google Drive download failed (HTTP {error.resp.status}).") from error
-        except (GoogleAuthError, OSError, httplib2.HttpLib2Error) as error:
-            raise DriveError(
-                "Google Drive download failed. Check authentication and connectivity."
-            ) from error
-        return buffer.getvalue()

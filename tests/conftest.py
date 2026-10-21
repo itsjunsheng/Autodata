@@ -3,6 +3,7 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
+import google_drive
 import model_client
 from models import AnnotationRecord, Box, Sample, Settings
 
@@ -62,4 +63,11 @@ def rate_limit_waits(monkeypatch):
     # Tests never sleep; they assert the waits the client would have made.
     waits = []
     monkeypatch.setattr(model_client, "sleep", waits.append)
+    return waits
+
+
+@pytest.fixture(autouse=True)
+def drive_waits(monkeypatch):
+    waits = []
+    monkeypatch.setattr(google_drive, "sleep", waits.append)
     return waits

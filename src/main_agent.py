@@ -22,9 +22,9 @@ solver localises it and the weak solver does not.
 You receive: the image; the target coordinates; the human referring expressions; and every
 previous round for this target, with its expression, both solver boxes, their IoUs, the
 verifier's decision, and the judge's verdict when there was one. The verifier is deterministic
-and compares IoUs only. The judge sees the target drawn on the image and checks that every
-claim is visible and that no other object fits. All boxes use normalised XYXY coordinates on
-a 0-1000 scale.
+and compares IoUs only. The judge sees the target drawn on the image and rejects only a claim
+the image contradicts or an expression that fits another object just as well. All boxes use
+normalised XYXY coordinates on a 0-1000 scale.
 
 How to guide:
 - First round: choose a visible cue or relation for the challenger to build on.

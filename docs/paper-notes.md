@@ -29,7 +29,7 @@ The paper's settings vary by experiment: Section 3.1, the meta-optimisation setu
 | Grounding source | Original RefCOCO train image, target annotation, source referring expressions |
 | Main agent | OpenAI LLM creates the challenger prompt, analyses previous outcomes, and revises the strategy (`main_agent.py`) |
 | Challenger | OpenAI VLM creates a referring expression from the main agent's prompt (`challenger.py`) |
-| Referring-expression checks | Candidates go directly to both solvers; a VLM judge (`judge.py`) then reviews each round that passes the three IoU checks for visible truth of every claim and for other matching objects, including the object the weak solver chose |
+| Referring-expression checks | Candidates go directly to both solvers; a VLM judge (`judge.py`) then reviews each round that passes the three IoU checks for claims the image contradicts and for other objects, including the weak solver's choice, that the whole expression fits |
 | Weak solver | The target Qwen3-VL model called through OpenRouter (`solver.py`) |
 | Strong solver | Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM; correctness measured per candidate (`solver.py`) |
 | Objective evaluator | Python IoU against the unchanged RefCOCO annotation |
@@ -47,7 +47,7 @@ The implementation imports every referred object of each image and uses one cand
 - The target coordinates and human expressions go only to the main agent and challenger, and the marked image only to the judge; the deterministic verifier receives ground-truth and predicted boxes. Solvers see clean images and referring expressions in fresh requests, without main-agent instructions, with no system turn, and in the same user prompt as the training file.
 - Both solvers receive the same task and coordinate convention. Qwen is never instructed to be weak.
 - Every generated referring expression is sent to the solvers, including duplicates. The judge runs only after the three checks pass, never before the solvers.
-- Solver agreement or a high IoU does not establish referring expression truthfulness or uniqueness; the judge checks both on passing rounds and is itself a model judgment with its own error rate.
+- Solver agreement or a high IoU does not establish referring expression truthfulness or uniqueness; the judge checks both on passing rounds, rejecting only on a named contradiction or competitor, and is itself a model judgment with its own error rate.
 - Provider failures, refusals, truncation, and invalid coordinates produce an error, not a successful weak-failure criterion.
 - The final answer comes from RefCOCO, not a potentially imprecise model prediction.
 - Rejected/exhausted targets remain inspectable and are excluded from the training bundle.

@@ -112,14 +112,21 @@ class ChallengerDirection(StrictModel):
 
 class Claim(StrictModel):
     claim: Annotated[str, text_limit(200)]
-    visible: bool
+    # What the image shows for this claim, in a few words; the verdict follows from it.
+    evidence: Annotated[str, text_limit(200)]
+    # Only a contradiction counts against the designated object.
+    target: Literal["true", "uncertain", "contradicted"]
 
 
 class Verdict(StrictModel):
-    # The judge's review of one referring expression against the marked target.
+    # The judge's review of one expression: its claims about the target, and what else it fits.
 
     claims: list[Claim]
-    other_matches: int = Field(ge=0)
+    # The evidence of ambiguity; the description travels with the schema to the judge.
+    also_fits: list[Annotated[str, text_limit(200)]] = Field(
+        description="Each other object every claim is true of, described in a few words. Empty "
+        "when the expression fits the target only; an object you ruled out does not belong here."
+    )
     reason: Annotated[str, text_limit(400)]
 
 

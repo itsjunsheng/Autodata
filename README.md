@@ -14,7 +14,7 @@ accepted ones as a Qwen training set.
 ## Getting started
 
 Requires Python 3.11+, OpenAI and OpenRouter API access, a Supabase project,
-and a Google Drive folder with two subfolders, `images` and `previews`.
+and a Google Drive folder with three subfolders, `images`, `previews` and `accepted`.
 
 ### Python environment
 
@@ -78,8 +78,9 @@ python src/main.py supabase-check
 2. Configure the OAuth consent screen and create a **Desktop app** OAuth client.
    Add your account as a test user if the app is in testing mode.
 3. Save the downloaded client JSON to `credentials/google_client.json`.
-4. Create two folders named `images` and `previews` inside the project folder. The
-   code looks these two up and creates one subfolder per run inside `previews`.
+4. Create three folders named `images`, `previews` and `accepted` inside the project
+   folder. The code looks these up and creates one subfolder per run inside `previews`
+   and `accepted`.
 5. Set `GOOGLE_DRIVE_FOLDER_ID` to the project folder's ID, then sign in and check:
 
 ```powershell
@@ -125,15 +126,15 @@ After an interrupted import, rerun the same command.
 python src/main.py run --targets 10
 ```
 
-Each target gets up to six rounds and stops when accepted. The command prints
-the run ID and links to round previews. Targets are processed in import order.
-A run that stops early continues under the same run ID with `--resume`: finished targets
-are skipped and unfinished ones, including those that ended in an error, are redone from
-round one, and their earlier rounds are removed.
-A rate-limited model call is retried with waits of up to a few minutes before it counts
-as an error. A model error marks that target's round `error` with the message in
-`feedback`, and the batch continues with the next target. After three consecutive failed targets the
-batch stops and the run status is `error`.
+Each target gets up to six rounds and stops when accepted. The command prints the run ID
+and links to round previews. Targets are processed in import order. A run that stops
+early continues under the same run ID with `--resume`: finished targets are skipped and
+unfinished ones, including those that ended in an error, are redone from round one, and
+their earlier rounds are removed. A rate-limited model call is retried with waits of up
+to a few minutes, and a dropped Supabase or Drive request is retried twice, before
+either counts as an error. A model error marks that target's round `error` with the
+message in `feedback`, and the batch continues with the next target. After three
+consecutive failed targets the batch stops and the run status is `error`.
 
 | Option | Purpose |
 | --- | --- |
@@ -174,7 +175,7 @@ For LLaMA-Factory, set `dataset_dir: training/my_experiment` and
 | Weak solver | Predicts a box using Qwen through OpenRouter |
 | Strong solver | Predicts a box using Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM |
 | Verifier | Calculates IoU against ground truth and applies the three accept checks |
-| Judge | Sees the marked target and the weak solver's choice; rejects a passing expression whose claims are not visible or that fits another object |
+| Judge | Sees the marked target and the weak solver's choice; rejects a passing expression only for a claim the image contradicts or because it fits another object just as well |
 
 The main agent and challenger see the target annotation. Both solvers receive only
 the clean image and generated referring expression. Rejection feedback informs the
@@ -192,9 +193,10 @@ A round is accepted only when all three conditions hold:
 
 The threshold, the gap and the round limit are defaults on `Settings` in `models.py`.
 
-The verifier is deterministic. A round that passes it then goes to the judge, a model call
-that checks every stated claim is visible on the target and that no other object fits; its
-rejections keep status `rejected` with feedback starting `Rejected by judge`.
+The verifier is deterministic. A round that passes it then goes to the judge, a model
+call that rejects only on evidence, a claim the image contradicts or another object,
+including the weak solver's choice, that the whole expression fits; its rejections keep
+status `rejected` with feedback starting `Rejected by judge`.
 
 Boxes use **XYXY coordinates normalised to 0–1000**; IoU scores range from **0–1**.
 Training export rounds ground-truth box edges outward to integers.
@@ -208,11 +210,13 @@ folders you created inside the project folder:
 Drive root/
   images/581857.jpg
   previews/<run id>/ref 0 round 1.png
+  accepted/<run id>/ref 0 round 6.png
 ```
 
 `images/` holds one original per COCO image, named by its COCO image ID. `previews/`
 holds one folder per run, with one PNG per loop round named by RefCOCO ref ID and round
-number.
+number. `accepted/` holds a copy of each accepted round's preview, in a folder per run,
+for auditing by hand.
 
 Round previews show the referring expression, outcome, and boxes: **green** for
 ground truth, **red** for the weak solver, and **blue** for the strong solver.

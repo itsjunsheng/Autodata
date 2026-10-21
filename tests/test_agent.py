@@ -34,7 +34,9 @@ class ScriptedRoles:
         self.judge_calls = 0
         self.judge_boxes = []
         self.verdict = Verdict(
-            claims=[Claim(claim="visible cue", visible=True)], other_matches=0, reason="ok"
+            claims=[Claim(claim="visible cue", evidence="seen", target="true")],
+            also_fits=[],
+            reason="ok",
         )
         self.client = SimpleNamespace(complete=self.direct)
         self.challenger = SimpleNamespace(generate=self.generate)
@@ -189,7 +191,9 @@ def test_main_agent_cannot_relax_verifier_gates(sample, image):
 def test_judge_rejection_keeps_rejected_status_and_the_loop_continues(sample, image):
     roles = ScriptedRoles(sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=2))
     roles.verdict = Verdict(
-        claims=[Claim(claim="purple apple", visible=False)], other_matches=0, reason="Apple is red."
+        claims=[Claim(claim="purple apple", evidence="seen", target="contradicted")],
+        also_fits=[],
+        reason="Apple is red.",
     )
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "exhausted"
@@ -209,7 +213,7 @@ def test_judge_pass_appends_its_note_to_the_verifier_feedback(sample, image):
     assert roles.judge_calls == 1
     assert roles.judge_boxes == [wrong_box()] == [result.rounds[0].weak.bbox]
     assert result.rounds[0].feedback.endswith(
-        "Judge: every claim is visible and no other object matches."
+        "Judge: no claim contradicted and no other object fits."
     )
 
 
@@ -234,17 +238,24 @@ def test_judge_model_error_is_recorded_as_an_error(sample, image):
     assert round_status(result, result.rounds[0]) == "error"
 
 
-def test_judge_accepts_when_every_claim_is_visible_and_nothing_else_matches():
-    verdict = Verdict(claims=[Claim(claim="red cup", visible=True)], other_matches=0, reason="ok")
+def test_judge_accepts_when_no_claim_is_contradicted_and_nothing_else_fits():
+    verdict = Verdict(
+        claims=[Claim(claim="red cup", evidence="seen", target="true")],
+        also_fits=[],
+        reason="ok",
+    )
     accepted, feedback = judge_decide(verdict)
     assert accepted
     assert feedback.startswith("Judge:")
 
 
-def test_judge_rejects_a_claim_that_is_not_visible_and_names_it():
+def test_judge_rejects_a_contradicted_claim_and_names_it():
     verdict = Verdict(
-        claims=[Claim(claim="red cup", visible=True), Claim(claim="on the shelf", visible=False)],
-        other_matches=0,
+        claims=[
+            Claim(claim="red cup", evidence="seen", target="true"),
+            Claim(claim="on the shelf", evidence="seen", target="contradicted"),
+        ],
+        also_fits=[],
         reason="No shelf.",
     )
     accepted, feedback = judge_decide(verdict)
@@ -253,11 +264,24 @@ def test_judge_rejects_a_claim_that_is_not_visible_and_names_it():
     assert "on the shelf" in feedback and "red cup" not in feedback
 
 
-def test_judge_rejects_when_other_objects_also_match():
+def test_judge_rejects_when_also_fits_also_fit_and_names_them():
     verdict = Verdict(
-        claims=[Claim(claim="cup", visible=True)], other_matches=2, reason="Two more."
+        claims=[Claim(claim="cup", evidence="seen", target="true")],
+        also_fits=["the cup on the left shelf", "the cup by the sink"],
+        reason="Two more cups.",
     )
     accepted, feedback = judge_decide(verdict)
     assert not accepted
     assert feedback.startswith("Rejected by judge")
-    assert "2 other object(s)" in feedback
+    assert "the cup on the left shelf" in feedback and "the cup by the sink" in feedback
+
+
+def test_judge_passes_an_unsettled_claim_and_says_so():
+    verdict = Verdict(
+        claims=[Claim(claim="red cup", evidence="seen", target="uncertain")],
+        also_fits=[],
+        reason="Too small to tell.",
+    )
+    accepted, feedback = judge_decide(verdict)
+    assert accepted
+    assert "1 claim(s) unsettled" in feedback

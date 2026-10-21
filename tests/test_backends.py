@@ -215,8 +215,8 @@ def test_judge_sends_both_images_and_parses_a_verdict(image, sample):
     def respond(request):
         requests.append(json.loads(request.content))
         reply = {
-            "claims": [{"claim": "red cup", "visible": True}],
-            "other_matches": 1,
+            "claims": [{"claim": "red cup", "evidence": "seen", "target": "true"}],
+            "also_fits": ["the red cup on the shelf"],
             "reason": "A second red cup.",
         }
         return httpx.Response(200, json=chat_body(json.dumps(reply)))
@@ -226,8 +226,8 @@ def test_judge_sends_both_images_and_parses_a_verdict(image, sample):
     chosen = Box(x_min=600, y_min=100, x_max=900, y_max=400)
     verdict = Judge(router, settings.judge_model).review(image, sample, "the red cup", chosen)
     assert verdict == Verdict(
-        claims=[{"claim": "red cup", "visible": True}],
-        other_matches=1,
+        claims=[{"claim": "red cup", "evidence": "seen", "target": "true"}],
+        also_fits=["the red cup on the shelf"],
         reason="A second red cup.",
     )
     request = requests[0]
@@ -303,8 +303,8 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
             },
             "GroundingAnswer": {"bbox_2d": [100, 200, 500, 800]},
             "Verdict": {
-                "claims": [{"claim": "cup beside the plate", "visible": True}],
-                "other_matches": 0,
+                "claims": [{"claim": "cup beside the plate", "evidence": "seen", "target": "true"}],
+                "also_fits": [],
                 "reason": "Only one cup.",
             },
         }

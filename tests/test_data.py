@@ -375,7 +375,7 @@ def test_import_goes_directly_to_cloud_and_reuses_originals(image, tmp_path, mon
     assert record["referring_expressions"] == ["the red cup"]
     assert {
         row["name"] for row in cloud.objects.values() if row.get("parents") == ["root-folder"]
-    } == {"images", "previews"}
+    } == {"images", "previews", "accepted"}
     assert cloud.contents[record["image_file_id"]] == original
     assert cloud.objects[record["image_file_id"]]["name"] == "20.jpg"
     assert sum(method == "PUT" for method, _ in cloud.requests) == 1
