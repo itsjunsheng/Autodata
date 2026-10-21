@@ -3,6 +3,7 @@
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from time import sleep
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -17,6 +18,23 @@ ANNOTATION_FIELDS = (
 )
 ACCEPTED_FIELDS = "referring_expression,refcoco_annotations(image_file_id,width,height,bbox_2d)"
 PAGE_SIZE = 50
+RUN_SETTINGS = frozenset(
+    {
+        "main_model",
+        "challenger_model",
+        "weak_model",
+        "strong_model",
+        "judge_model",
+        "iou_threshold",
+        "min_iou_gap",
+        "max_rounds",
+    }
+)
+RUN_FIELDS = (
+    "id,main_model,challenger_model,weak_model,strong_model,judge_model,iou_threshold,"
+    "min_iou_gap,max_rounds,target_offset,target_count,status,finished_at"
+)
+RETRY_DELAYS = (2, 5)  # seconds before the second and third attempt of a timed-out request
 
 
 class SupabaseError(RuntimeError):
@@ -52,22 +70,30 @@ def create_supabase_client() -> Client:
 
 
 def _execute(query, operation: str):
-    try:
-        return query.execute()
-    except (APIError, httpx.HTTPError) as error:
-        raise SupabaseError(
-            f"Supabase could not {operation}; check access and connectivity."
-        ) from error
+    # Retry transport failures only; a database rejection is deterministic and reports its code.
+    # Messages carry no server text, which could echo the key.
+    for delay in (*RETRY_DELAYS, None):
+        try:
+            return query.execute()
+        except APIError as error:
+            raise SupabaseError(
+                f"Supabase could not {operation} (error code {error.code}); "
+                "check the schema and access."
+            ) from error
+        except httpx.HTTPError as error:
+            if delay is None:
+                raise SupabaseError(
+                    f"Supabase could not {operation} ({type(error).__name__} after "
+                    f"{len(RETRY_DELAYS) + 1} attempts); check connectivity."
+                ) from error
+            sleep(delay)
 
 
 def check_supabase_connection(client: Client) -> dict:
     # Read-only checks of the required tables and columns; no Storage bucket.
     columns = {
         "refcoco_annotations": ANNOTATION_FIELDS,
-        "runs": (
-            "id,main_model,challenger_model,weak_model,strong_model,judge_model,"
-            "iou_threshold,min_iou_gap,max_rounds,status,finished_at"
-        ),
+        "runs": RUN_FIELDS,
         "rounds": (
             "run_id,ref_id,round_number,referring_expression,weak_bbox_2d,"
             "strong_bbox_2d,weak_iou,strong_iou,status,feedback,preview_file_id"
@@ -92,9 +118,9 @@ def check_supabase_connection(client: Client) -> dict:
 class SupabaseStore:
     # Read source targets and persist workflow records; image bytes live in Drive.
 
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, run_id: str | None = None):
         self.client = client
-        self.run_id = str(uuid4())
+        self.run_id = run_id or str(uuid4())
         self.saved_rounds: dict[tuple[int, int], dict] = {}
 
     def save_annotation(self, record: AnnotationRecord) -> None:
@@ -154,28 +180,58 @@ class SupabaseStore:
                 loaded += 1
                 yield AnnotationRecord.model_validate(row).as_sample()
 
-    def start(self, settings: Settings) -> None:
+    def start(self, settings: Settings, offset: int, count: int) -> None:
         _execute(
-            self.client.table("runs").insert(
+            self.client.table("runs").upsert(
                 {
                     "id": self.run_id,
-                    **settings.model_dump(
-                        include={
-                            "main_model",
-                            "challenger_model",
-                            "weak_model",
-                            "strong_model",
-                            "judge_model",
-                            "iou_threshold",
-                            "min_iou_gap",
-                            "max_rounds",
-                        }
-                    ),
+                    **settings.model_dump(include=RUN_SETTINGS),
+                    "target_offset": offset,
+                    "target_count": count,
                     "status": "running",
-                }
+                },
+                on_conflict="id",
             ),
             "start the run",
         )
+
+    def load_run(self) -> dict:
+        rows = _execute(
+            self.client.table("runs").select(RUN_FIELDS).eq("id", self.run_id).limit(1),
+            "load the run",
+        ).data
+        if not rows:
+            raise ValueError(f"Run {self.run_id} does not exist.")
+        return rows[0]
+
+    def clear_rounds(self, ref_id: int) -> None:
+        # A target is always processed from round one; rows of an earlier attempt would linger.
+        _execute(
+            self.client.table("rounds").delete().eq("run_id", self.run_id).eq("ref_id", ref_id),
+            "clear the target's rounds",
+        )
+
+    def finished_targets(self, max_rounds: int) -> set[int]:
+        # Targets that need no more work: accepted, or rejected on the last allowed round.
+        done = set()
+        offset = 0
+        while True:
+            rows = _execute(
+                self.client.table("rounds")
+                .select("ref_id,round_number,status")
+                .eq("run_id", self.run_id)
+                .order("ref_id")
+                .order("round_number")
+                .range(offset, offset + PAGE_SIZE - 1),
+                "read the run's rounds",
+            ).data
+            for row in rows:
+                exhausted = row["status"] == "rejected" and row["round_number"] == max_rounds
+                if row["status"] == "accepted" or exhausted:
+                    done.add(row["ref_id"])
+            if len(rows) < PAGE_SIZE:
+                return done
+            offset += len(rows)
 
     def save_round(self, result: Result, status: str, preview_file_id: str | None = None) -> None:
         # Checkpoint a loop; an accepted round is the accepted example.

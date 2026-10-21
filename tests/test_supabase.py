@@ -2,10 +2,17 @@ import json
 
 import httpx
 import pytest
+from conftest import make_settings
 from supabase import ClientOptions, create_client
 
+import supabase_client
 from main import main
-from supabase_client import SupabaseError, check_supabase_connection, create_supabase_client
+from supabase_client import (
+    SupabaseError,
+    SupabaseStore,
+    check_supabase_connection,
+    create_supabase_client,
+)
 
 PROJECT_URL = "https://aqmpmnnnvpmthpfwfibb.supabase.co"
 TEST_KEY = "sb_secret_test_only"
@@ -31,6 +38,7 @@ class MemorySupabase:
         self.requests = []
         self.fail_round_write = False
         self.fail_annotation_write = False
+        self.timeout_writes = 0
         self.client = mock_client(self.respond)
 
     def seed(self, record):
@@ -74,7 +82,19 @@ class MemorySupabase:
                 json=rows[offset : offset + limit],
                 headers={"Content-Range": f"*/{len(rows)}"},
             )
+        if request.method == "DELETE":
+            wanted = {f: v[3:] for f, v in request.url.params.items() if v.startswith("eq.")}
+            for key in [
+                key
+                for key, row in self.tables[table].items()
+                if all(str(row.get(f)) == v for f, v in wanted.items())
+            ]:
+                del self.tables[table][key]
+            return httpx.Response(200, json=[])
         row = json.loads(request.content)
+        if self.timeout_writes:
+            self.timeout_writes -= 1
+            raise httpx.ReadTimeout("timed out", request=request)
         if (self.fail_round_write and table == "rounds") or (
             self.fail_annotation_write and table == "refcoco_annotations"
         ):
@@ -175,3 +195,36 @@ def test_cli_missing_key_creates_no_local_files(monkeypatch, capsys, tmp_path):
     assert main(["supabase-check"]) == 1
     assert "Set SUPABASE_API_KEY" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
+
+
+def test_transient_write_timeout_is_retried(monkeypatch):
+    memory = MemorySupabase()
+    memory.timeout_writes = 1
+    delays = []
+    monkeypatch.setattr(supabase_client, "sleep", delays.append)
+    store = SupabaseStore(memory.client)
+    store.start(make_settings(), 0, 1)
+    assert memory.tables["runs"][store.run_id]["status"] == "running"
+    assert delays == [2]
+
+
+def test_persistent_write_timeout_names_the_failure_without_the_key(monkeypatch):
+    memory = MemorySupabase()
+    memory.timeout_writes = 10
+    delays = []
+    monkeypatch.setattr(supabase_client, "sleep", delays.append)
+    with pytest.raises(SupabaseError) as error:
+        SupabaseStore(memory.client).start(make_settings(), 0, 1)
+    assert "ReadTimeout" in str(error.value)
+    assert TEST_KEY not in str(error.value)
+    assert delays == [2, 5]
+
+
+def test_database_rejection_is_not_retried_and_reports_its_code(monkeypatch, sample_record):
+    memory = MemorySupabase()
+    memory.fail_annotation_write = True
+    monkeypatch.setattr(supabase_client, "sleep", lambda _: pytest.fail("must not retry"))
+    with pytest.raises(SupabaseError) as error:
+        SupabaseStore(memory.client).save_annotation(sample_record)
+    assert "42501" in str(error.value)
+    assert TEST_KEY not in str(error.value)

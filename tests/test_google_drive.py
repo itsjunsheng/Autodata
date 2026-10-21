@@ -133,8 +133,13 @@ class MemoryDrive:
                 response["nextPageToken"] = str(offset + limit)
             return self.response(response)
         if parsed.path == "/drive/v3/files" and method == "POST":
-            self.folder_creates.append(json.loads(body))
-            return self.response({"error": {"message": "unexpected create"}}, status=500)
+            metadata = json.loads(body)
+            self.folder_creates.append(metadata)
+            if metadata.get("mimeType") != FOLDER_MIME:
+                return self.response({"error": {"message": "unexpected create"}}, status=500)
+            folder_id = self.new_id("folder")
+            self.objects[folder_id] = {**metadata, "id": folder_id, "trashed": False}
+            return self.response({"id": folder_id})
         file_id = parsed.path.rsplit("/", 1)[-1]
         if file_id not in self.objects:
             return self.response(
@@ -320,3 +325,14 @@ def test_failed_oauth_login_does_not_print_provider_details(tmp_path, monkeypatc
     with pytest.raises(DriveError) as error:
         authenticate_drive()
     assert "secret provider detail" not in str(error.value)
+
+
+def test_run_folder_is_created_once_inside_previews_and_reused_on_resume():
+    memory = MemoryDrive()
+    first = memory.drive.run_folder("run-1")
+    again = GoogleDrive(memory.service, "root-folder").run_folder("run-1")
+    assert first == again
+    assert len(memory.folder_creates) == 1
+    created = memory.objects[first]
+    assert created["name"] == "run-1" and created["mimeType"] == FOLDER_MIME
+    assert memory.objects[created["parents"][0]]["name"] == PREVIEWS_FOLDER

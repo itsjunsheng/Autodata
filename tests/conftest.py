@@ -3,6 +3,7 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
+import model_client
 from models import AnnotationRecord, Box, Sample, Settings
 
 TEST_MODELS = {
@@ -54,3 +55,11 @@ def sample_record(sample) -> AnnotationRecord:
         ref_id=sample.ref_id,
         category="cup",
     )
+
+
+@pytest.fixture(autouse=True)
+def rate_limit_waits(monkeypatch):
+    # Tests never sleep; they assert the waits the client would have made.
+    waits = []
+    monkeypatch.setattr(model_client, "sleep", waits.append)
+    return waits

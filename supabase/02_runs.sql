@@ -1,4 +1,4 @@
--- One row per `run` command: the models, IoU thresholds, and execution status.
+-- One row per `run` command: the models, IoU thresholds, target range, and execution status.
 -- Run after 00_normalized_bbox.sql.
 begin;
 
@@ -12,6 +12,8 @@ create table public.runs (
     iou_threshold double precision not null check (iou_threshold > 0 and iou_threshold <= 1),
     min_iou_gap double precision not null check (min_iou_gap between 0 and 1),
     max_rounds integer not null check (max_rounds between 1 and 20),
+    target_offset integer not null check (target_offset >= 0),
+    target_count integer not null check (target_count > 0),
     status text not null default 'running' check (status in ('running', 'completed', 'error')),
     created_at timestamptz not null default now(),
     finished_at timestamptz

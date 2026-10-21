@@ -4,18 +4,33 @@ import base64
 import os
 import re
 from io import BytesIO
+from time import sleep
 from typing import Protocol, TypeVar
 
-from openai import NOT_GIVEN, APIError, NotFoundError, OpenAI
+from openai import NOT_GIVEN, APIError, NotFoundError, OpenAI, RateLimitError
 from PIL import Image
 from pydantic import BaseModel, ValidationError
 
 from models import Settings
 
+RATE_LIMIT_WAITS = (30, 60, 120)  # seconds; a provider's shared-pool throttle lasts minutes
+
 
 class ModelError(RuntimeError):
     # A failed model call, never evidence that a generated example is difficult.
     pass
+
+
+def _wait_out_rate_limits(role: str, request):
+    # The SDK's own retries span seconds; wait longer before giving a target up.
+    for wait in (*RATE_LIMIT_WAITS, None):
+        try:
+            return request()
+        except RateLimitError:
+            if wait is None:
+                raise
+            print(f"{role}: rate limited; waiting {wait}s before retrying.", flush=True)
+            sleep(wait)
 
 
 def api_error_message(error: APIError, role: str, model: str) -> str:
@@ -96,7 +111,8 @@ class OpenAIClient:
             key = os.getenv("OPENAI_API_KEY", "").strip()
             if not key or key in {"your-api-key", "sk-...", "YOUR_API_KEY"}:
                 raise ValueError("Set OPENAI_API_KEY in .env before running generation.")
-            client = OpenAI(api_key=key, timeout=90.0, max_retries=2)
+            # Retries absorb rate limits and transient 5xx instead of costing a target.
+            client = OpenAI(api_key=key, timeout=90.0, max_retries=5)
         self.client = client
 
     def check_model(self, model: str, role: str) -> None:
@@ -128,16 +144,19 @@ class OpenAIClient:
         ]
         content.append({"type": "input_text", "text": text})
         try:
-            response = self.client.responses.parse(
-                model=model,
-                instructions=instructions or NOT_GIVEN,
-                input=[{"role": "user", "content": content}],
-                text_format=schema,
-                # Low effort: reasoning tokens bill as output, and these roles need a brief
-                # diagnosis, not a long deliberation.
-                reasoning={"effort": "low"},
-                max_output_tokens=self.settings.max_output_tokens,
-                store=False,
+            response = _wait_out_rate_limits(
+                role,
+                lambda: self.client.responses.parse(
+                    model=model,
+                    instructions=instructions or NOT_GIVEN,
+                    input=[{"role": "user", "content": content}],
+                    text_format=schema,
+                    # Low effort: reasoning tokens bill as output, and these roles need a brief
+                    # diagnosis, not a long deliberation.
+                    reasoning={"effort": "low"},
+                    max_output_tokens=self.settings.max_output_tokens,
+                    store=False,
+                ),
             )
         except APIError as error:
             raise ModelError(api_error_message(error, role, model)) from error
@@ -167,7 +186,7 @@ class OpenRouterClient:
                 base_url=OPENROUTER_BASE_URL,
                 api_key=key,
                 timeout=120.0,
-                max_retries=2,
+                max_retries=6,
             )
         self.client = client
         self._catalogue: dict | None = None
@@ -213,22 +232,25 @@ class OpenRouterClient:
         if instructions is not None:
             messages.insert(0, {"role": "system", "content": instructions})
         try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                # Greedy decoding: one solver rollout is reproducible and matches greedy
-                # evaluation of the fine-tuned model.
-                temperature=0,
-                max_tokens=self.settings.max_output_tokens,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema.__name__,
-                        "strict": True,
-                        "schema": schema.model_json_schema(),
+            response = _wait_out_rate_limits(
+                role,
+                lambda: self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    # Greedy decoding: one solver rollout is reproducible and matches greedy
+                    # evaluation of the fine-tuned model.
+                    temperature=0,
+                    max_tokens=self.settings.max_output_tokens,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema.__name__,
+                            "strict": True,
+                            "schema": schema.model_json_schema(),
+                        },
                     },
-                },
-                extra_body={"provider": {"require_parameters": True}},
+                    extra_body={"provider": {"require_parameters": True}},
+                ),
             )
         except APIError as error:
             raise ModelError(

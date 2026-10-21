@@ -32,6 +32,7 @@ class ScriptedRoles:
         self.directions = []
         self.solve_calls = []
         self.judge_calls = 0
+        self.judge_boxes = []
         self.verdict = Verdict(
             claims=[Claim(claim="visible cue", visible=True)], other_matches=0, reason="ok"
         )
@@ -64,7 +65,6 @@ class ScriptedRoles:
         self.histories.append([r.model_dump() for r in history])
         return Candidate(
             referring_expression=f"cup beside visible object {len(history) + 1}",
-            strategy="relation",
         )
 
     def solve_weak(self, image, referring_expression):
@@ -75,8 +75,9 @@ class ScriptedRoles:
         self.solve_calls.append((referring_expression, "strong"))
         return Prediction(bbox=self.sample.target)
 
-    def review(self, image, sample, referring_expression):
+    def review(self, image, sample, referring_expression, chosen):
         self.judge_calls += 1
+        self.judge_boxes.append(chosen)
         return self.verdict
 
 
@@ -104,7 +105,7 @@ def test_rejection_feedback_changes_next_generation_and_stops_on_accept(sample, 
 def test_source_referring_expression_goes_directly_to_both_solvers(sample, image):
     roles = ScriptedRoles(sample, [wrong_box()], settings=make_settings(max_rounds=1))
     roles.challenger.generate = lambda *args: Candidate(
-        referring_expression=sample.referring_expressions[0], strategy="copy"
+        referring_expression=sample.referring_expressions[0]
     )
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "accepted"
@@ -115,9 +116,7 @@ def test_source_referring_expression_goes_directly_to_both_solvers(sample, image
 
 def test_repeated_referring_expression_is_evaluated_on_every_round(sample, image):
     roles = ScriptedRoles(sample, [sample.target, wrong_box()])
-    roles.challenger.generate = lambda *args: Candidate(
-        referring_expression="the cup on the left", strategy="position"
-    )
+    roles.challenger.generate = lambda *args: Candidate(referring_expression="the cup on the left")
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert len(result.rounds) == 2
@@ -146,7 +145,7 @@ def test_failed_api_call_is_not_a_weak_solver_mistake(sample, image):
 def test_round_accepted_only_when_all_three_checks_pass(weak, strong, accepted):
     current = Round(
         number=1,
-        candidate=Candidate(referring_expression="cup on left", strategy="position"),
+        candidate=Candidate(referring_expression="cup on left"),
         weak_iou=weak,
         strong_iou=strong,
     )
@@ -208,6 +207,7 @@ def test_judge_pass_appends_its_note_to_the_verifier_feedback(sample, image):
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert roles.judge_calls == 1
+    assert roles.judge_boxes == [wrong_box()] == [result.rounds[0].weak.bbox]
     assert result.rounds[0].feedback.endswith(
         "Judge: every claim is visible and no other object matches."
     )

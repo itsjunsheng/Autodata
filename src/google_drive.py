@@ -1,5 +1,6 @@
 # Authenticate with Google; store originals in images/ and round previews in previews/ in Drive.
-# The code never creates folders: the user creates images/ and previews/ in the root by hand.
+# The user creates images/ and previews/ by hand; the code creates only one folder per run
+# inside previews/.
 
 import hashlib
 import os
@@ -172,24 +173,39 @@ class GoogleDrive:
         return validate_file_id(found["id"])
 
     def _folder(self, name: str) -> str:
-        # Look up a folder the user made by hand; the code never creates one.
+        # Look up a folder the user made by hand.
         if name not in self.folders:
             found = self._find(self.folder_id, name)
             if found is None or found.get("mimeType") != FOLDER_MIME:
                 raise DriveError(
-                    f"Create a folder named '{name}' inside the configured Drive folder; "
-                    "the code never creates folders."
+                    f"Create a folder named '{name}' inside the configured Drive folder."
                 )
             self.folders[name] = validate_file_id(found["id"])
         return self.folders[name]
 
+    def run_folder(self, run_id: str) -> str:
+        # The one folder the code creates: previews/<run id>, reused when a run resumes.
+        parent = self._folder(PREVIEWS_FOLDER)
+        found = self._find(parent, run_id)
+        if found is not None:
+            if found.get("mimeType") != FOLDER_MIME:
+                raise DriveError("A file occupies the run's preview folder name.")
+            return validate_file_id(found["id"])
+        created = self._execute(
+            self.files.create(
+                body={"name": run_id, "parents": [parent], "mimeType": FOLDER_MIME},
+                fields="id",
+                supportsAllDrives=True,
+            )
+        )
+        return validate_file_id(created["id"])
+
     def upload(
-        self, folder: str, name: str, content: bytes, content_type: str, *, immutable: bool = False
+        self, parent: str, name: str, content: bytes, content_type: str, *, immutable: bool = False
     ) -> str:
         # Reuse a matching original; update an existing round preview without making copies.
         if not name or "/" in name or "\\" in name:
             raise DriveError("Drive file names must not be empty or contain slashes.")
-        parent = self._folder(folder)
         found = self._find(parent, name)
         if found and found.get("mimeType") == FOLDER_MIME:
             raise DriveError("A folder occupies the expected Drive file name.")
@@ -222,7 +238,7 @@ class GoogleDrive:
         # Store an original under its real COCO file name; a repeat upload reuses the file.
         if content_type not in IMAGE_SUFFIXES:
             raise DriveError("Images must be JPEG, PNG, or WebP.")
-        return self.upload(IMAGES_FOLDER, name, content, content_type, immutable=True)
+        return self.upload(self._folder(IMAGES_FOLDER), name, content, content_type, immutable=True)
 
     def download(self, file_id: str) -> bytes:
         # Read a file into memory, with bounded retries and no disk cache.

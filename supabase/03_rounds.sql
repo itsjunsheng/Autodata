@@ -35,7 +35,7 @@ create unique index rounds_one_accepted_per_ref_idx
 -- Trusted Python backend only.
 alter table public.rounds enable row level security;
 revoke all on public.rounds from anon, authenticated;
-grant select, insert, update on public.rounds to service_role;
+grant select, insert, update, delete on public.rounds to service_role;
 
 notify pgrst, 'reload schema';
 commit;

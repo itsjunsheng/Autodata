@@ -182,7 +182,7 @@ def load_image(content: bytes, width: int, height: int) -> Image.Image:
 
 
 def target_views(image: Image.Image, target: Box) -> list[Image.Image]:
-    # Privileged original and marked views for the main agent and challenger.
+    # Original and marked views for the judge, the one role that sees the target drawn.
     marked = image.copy()
     draw = ImageDraw.Draw(marked)
     coords = target.pixels(*image.size)

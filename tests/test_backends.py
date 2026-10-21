@@ -14,7 +14,7 @@ from judge import INSTRUCTIONS as JUDGE_INSTRUCTIONS
 from judge import Judge
 from main_agent import MainAgent
 from model_client import OPENROUTER_BASE_URL, ModelError, OpenAIClient, OpenRouterClient
-from models import Candidate, ChallengerDirection, GroundingAnswer, Settings, Verdict
+from models import Box, Candidate, ChallengerDirection, GroundingAnswer, Settings, Verdict
 from solver import Solver, grounding_prompt
 from verifier import Verifier
 
@@ -223,7 +223,8 @@ def test_judge_sends_both_images_and_parses_a_verdict(image, sample):
 
     settings = make_settings()
     router = OpenRouterClient(settings, client=mock_client(respond, OPENROUTER_BASE_URL))
-    verdict = Judge(router, settings.judge_model).review(image, sample, "the red cup")
+    chosen = Box(x_min=600, y_min=100, x_max=900, y_max=400)
+    verdict = Judge(router, settings.judge_model).review(image, sample, "the red cup", chosen)
     assert verdict == Verdict(
         claims=[{"claim": "red cup", "visible": True}],
         other_matches=1,
@@ -235,6 +236,7 @@ def test_judge_sends_both_images_and_parses_a_verdict(image, sample):
     content = request["messages"][1]["content"]
     assert [part["type"] for part in content] == ["image_url", "image_url", "text"]
     assert "the red cup" in content[-1]["text"] and "target_bbox_2d" in content[-1]["text"]
+    assert "weak_solver_bbox_2d" in content[-1]["text"]
     assert request["response_format"]["json_schema"]["name"] == "Verdict"
 
 
@@ -298,7 +300,6 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
             },
             "Candidate": {
                 "referring_expression": "cup beside the white plate",
-                "strategy": "relation",
             },
             "GroundingAnswer": {"bbox_2d": [100, 200, 500, 800]},
             "Verdict": {
@@ -331,7 +332,7 @@ def test_complete_openai_qwen_loop_through_sdk_transports(tmp_path, image, sampl
     result = main_agent.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert len(result.rounds) == 1
-    assert [len(r["input"][0]["content"]) for r in openai_requests] == [3, 3, 2, 3]
+    assert [len(r["input"][0]["content"]) for r in openai_requests] == [2, 2, 2, 3]
     challenger_input = json.loads(openai_requests[1]["input"][0]["content"][-1]["text"])
     for request in openai_requests[:2]:
         assert request["instructions"]
@@ -474,11 +475,8 @@ def test_response_schemas_use_only_openai_strict_keywords(schema):
 @pytest.mark.parametrize("value", ["", "   ", "x" * 401])
 def test_candidate_text_limits_still_apply_after_parsing(value):
     with pytest.raises(ValidationError):
-        Candidate(referring_expression=value, strategy="relation")
-    assert (
-        len(Candidate(referring_expression="x" * 400, strategy="relation").referring_expression)
-        == 400
-    )
+        Candidate(referring_expression=value)
+    assert len(Candidate(referring_expression="x" * 400).referring_expression) == 400
 
 
 def test_direction_text_limits_still_apply_after_parsing():
@@ -507,3 +505,33 @@ def test_model_ids_come_from_env_with_no_defaults(monkeypatch):
         monkeypatch.setenv(name, "model-" + name.lower())
     settings = Settings.from_env(max_rounds=1)
     assert settings.weak_model == "model-autodata_weak_model" and settings.max_rounds == 1
+
+
+def test_rate_limit_is_waited_out_and_the_call_then_succeeds(image, rate_limit_waits):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": {"message": "rate-limited upstream"}})
+        return httpx.Response(200, json=chat_body('{"bbox_2d":[100,200,500,800]}'))
+
+    router = OpenRouterClient(make_settings(), client=mock_client(respond, OPENROUTER_BASE_URL))
+    prediction = Solver(router, make_settings().weak_model, "weak_solver").solve(image, "cup")
+    assert prediction.bbox.as_xyxy() == [100, 200, 500, 800]
+    assert rate_limit_waits == [30]
+    assert len(calls) == 2
+
+
+def test_persistent_rate_limit_fails_after_bounded_waits(image, rate_limit_waits):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(429, json={"error": {"message": "rate-limited upstream"}})
+
+    router = OpenRouterClient(make_settings(), client=mock_client(respond, OPENROUTER_BASE_URL))
+    with pytest.raises(ModelError, match="RateLimitError"):
+        Solver(router, make_settings().weak_model, "weak_solver").solve(image, "cup")
+    assert rate_limit_waits == [30, 60, 120]
+    assert len(calls) == 4

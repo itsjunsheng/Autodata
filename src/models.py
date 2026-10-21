@@ -101,7 +101,6 @@ class Sample(StrictModel):
 
 class Candidate(StrictModel):
     referring_expression: Annotated[str, text_limit(400)]
-    strategy: Annotated[str, text_limit(400)]
 
 
 class ChallengerDirection(StrictModel):

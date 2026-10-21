@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 from challenger import Challenger
 from dataset import load_image
 from google_drive import (
-    PREVIEWS_FOLDER,
     DriveError,
     GoogleDrive,
     authenticate_drive,
@@ -28,6 +27,7 @@ from models import Result, Sample, Settings
 from outputs import export_training, render_round_preview, round_status
 from solver import Solver
 from supabase_client import (
+    RUN_SETTINGS,
     SupabaseError,
     SupabaseStore,
     check_supabase_connection,
@@ -44,23 +44,33 @@ def run_batch(
     main_agent: MainAgent,
     store: SupabaseStore,
     drive: GoogleDrive,
+    *,
+    offset: int = 0,
+    done: frozenset[int] | set[int] = frozenset(),
 ) -> dict:
     # Process one target at a time, downloading each distinct image once.
     # Checkpoint partial rounds and final previews.
     counts = Counter()
-    processed = rounds = consecutive_errors = 0
+    processed = rounds = consecutive_errors = skipped = 0
     previous_file_id = None
     image = None
     print(f"Supabase run ID: {store.run_id}", flush=True)
     try:
-        store.start(main_agent.settings)
+        store.start(main_agent.settings, offset, requested)
+        previews = drive.run_folder(store.run_id)
         for sample in samples:
+            if sample.ref_id in done:
+                skipped += 1
+                continue
+            store.clear_rounds(sample.ref_id)
             if sample.image_file_id != previous_file_id:
                 image = load_image(
                     drive.download(sample.image_file_id), sample.width, sample.height
                 )
                 previous_file_id = sample.image_file_id
-            print(f"[{processed + 1}/{requested}] Curating ref {sample.ref_id}", flush=True)
+            print(
+                f"[{processed + skipped + 1}/{requested}] Curating ref {sample.ref_id}", flush=True
+            )
             if image is None or image.size != (sample.width, sample.height):
                 raise ValueError("Image dimensions disagree with the grounding annotation.")
             # Keep only this target's checkpoint cache, even in very large runs.
@@ -79,8 +89,8 @@ def run_batch(
                     buffer = BytesIO()
                     preview.save(buffer, format="PNG")
                     file_id = drive.upload(
-                        PREVIEWS_FOLDER,
-                        f"{store.run_id} ref {sample.ref_id} round {latest.number}.png",
+                        previews,
+                        f"ref {sample.ref_id} round {latest.number}.png",
                         buffer.getvalue(),
                         "image/png",
                     )
@@ -109,13 +119,14 @@ def run_batch(
                     break
             else:
                 consecutive_errors = 0
-        status = "completed" if processed == requested else "error"
+        status = "completed" if processed + skipped == requested else "error"
         store.finish(status)
         return {
             "status": status,
             "requested": requested,
             "processed": processed,
-            "unprocessed": requested - processed,
+            "skipped": skipped,
+            "unprocessed": requested - processed - skipped,
             "accepted": counts["accepted"],
             "exhausted": counts["exhausted"],
             "errors": counts["error"],
@@ -164,9 +175,18 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("drive-check", help="Check Google login and root-folder access.")
     commands.add_parser("supabase-check", help="Check Supabase tables and required columns.")
     run = commands.add_parser("run", help="Curate targets read from Supabase.")
-    run.add_argument("--limit", type=positive_int, default=10)
+    run.add_argument(
+        "--targets", type=positive_int, default=10, help="Number of imported targets to process."
+    )
     run.add_argument(
         "--offset", type=nonnegative_int, default=0, help="Skip this many database targets."
+    )
+    run.add_argument(
+        "--resume",
+        type=UUID,
+        metavar="RUN_ID",
+        help="Continue an interrupted run by its ID; its target range is reused "
+        "and --targets/--offset are ignored.",
     )
     run.add_argument(
         "--dry-run",
@@ -221,17 +241,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Downloaded {count} accepted examples to {args.output}")
             return 0
         settings = Settings.from_env()
-        available = store.annotation_count() - args.offset
-        if available < args.limit:
+        offset, count, done = args.offset, args.targets, set()
+        if args.resume:
+            store = SupabaseStore(client, str(args.resume))
+            run_row = store.load_run()
+            if run_row["status"] == "completed":
+                print(f"Run {store.run_id} is already completed.")
+                return 0
+            saved_settings = {name: run_row[name] for name in RUN_SETTINGS}
+            if saved_settings != settings.model_dump(include=RUN_SETTINGS):
+                raise ValueError(
+                    f"Run {store.run_id} used different models or thresholds. "
+                    "Resume with the same .env or start a new run."
+                )
+            offset, count = run_row["target_offset"], run_row["target_count"]
+            done = store.finished_targets(settings.max_rounds)
+            print(f"Resuming run {store.run_id}: {len(done)} of {count} targets already finished.")
+        available = store.annotation_count() - offset
+        if available < count:
             raise ValueError(
-                f"Only {max(0, available)} training targets available after offset {args.offset}. "
-                "Import more data or reduce --limit."
+                f"Only {max(0, available)} training targets available after offset {offset}. "
+                "Import more data or reduce --targets."
             )
-        samples = store.iter_samples(args.limit, offset=args.offset)
+        samples = store.iter_samples(count, offset=offset)
         if args.dry_run:
             for sample in samples:
                 load_image(drive.download(sample.image_file_id), sample.width, sample.height)
-            print(f"Validated {args.limit} cloud targets. No model calls or output files.")
+            print(f"Validated {count} cloud targets. No model calls or output files.")
             return 0
         openai_client = OpenAIClient(settings)
         openrouter = OpenRouterClient(settings)
@@ -250,8 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Strong solver: {settings.strong_provider} / {settings.strong_model}")
         print(f"Weak solver: openrouter / {settings.weak_model}")
-        print(f"Maximum {args.limit * settings.max_rounds * 5} model calls, excluding retries.")
-        summary = run_batch(samples, args.limit, agent, store, drive)
+        print(f"Maximum {count * settings.max_rounds * 5} model calls, excluding retries.")
+        summary = run_batch(samples, count, agent, store, drive, offset=offset, done=done)
         print(json.dumps(summary, indent=2))
         print(f"Accepted examples: rounds with status 'accepted' for run {summary['run_id']}")
         return 0 if summary["status"] == "completed" else 1

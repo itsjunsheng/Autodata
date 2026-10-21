@@ -18,7 +18,7 @@ from model_client import ModelError
 from models import Claim, Prediction, Verdict
 from outputs import export_training
 from solver import grounding_prompt
-from supabase_client import SupabaseError, SupabaseStore
+from supabase_client import RUN_FIELDS, SupabaseError, SupabaseStore
 
 
 def cloud_for(sample_record, image_bytes):
@@ -70,7 +70,9 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     assert example.image_file_id == sample.image_file_id
     assert example.referring_expression == row["referring_expression"]
     assert cloud.contents[sample.image_file_id] == image_bytes
-    assert cloud.objects[row["preview_file_id"]]["name"] == f"{store.run_id} ref 1 round 1.png"
+    preview = cloud.objects[row["preview_file_id"]]
+    assert preview["name"] == "ref 1 round 1.png"
+    assert cloud.objects[preview["parents"][0]]["name"] == store.run_id
     with Image.open(BytesIO(cloud.contents[row["preview_file_id"]])) as preview:
         left = (preview.width - sample.width) // 2
         marked = preview.crop(
@@ -124,9 +126,9 @@ def test_previews_are_named_by_ref_id_and_do_not_overwrite_shared_images(
     run_batch(store.iter_samples(2), 2, roles.main, store, cloud.drive)
     saved = list(memory.tables["rounds"].values())
     assert [cloud.objects[row["preview_file_id"]]["name"] for row in saved] == [
-        f"{store.run_id} ref 1 round 1.png",
-        f"{store.run_id} ref 1 round 2.png",
-        f"{store.run_id} ref 2 round 1.png",
+        "ref 1 round 1.png",
+        "ref 1 round 2.png",
+        "ref 2 round 1.png",
     ]
     assert len({row["preview_file_id"] for row in saved}) == 3
     assert [row["round_number"] for row in saved] == [1, 2, 1]
@@ -348,7 +350,7 @@ def test_dry_run_reads_cloud_images_without_models_or_writes(
 
     monkeypatch.setattr("main.OpenAIClient", unexpected)
     monkeypatch.setattr("main.OpenRouterClient", unexpected)
-    assert main(["run", "--limit", "1", "--dry-run"]) == 0
+    assert main(["run", "--targets", "1", "--dry-run"]) == 0
     assert memory.tables["runs"] == memory.tables["rounds"] == {}
     assert all(method == "GET" for method, _ in cloud.requests)
     assert list(tmp_path.iterdir()) == []
@@ -360,7 +362,7 @@ def test_empty_database_fails_before_model_calls(monkeypatch, tmp_path, capsys):
     configure_cli(monkeypatch, memory, cloud)
     monkeypatch.setattr("main.OpenAIClient", lambda *args: pytest.fail("No data available"))
     monkeypatch.setattr("main.OpenRouterClient", lambda *args: pytest.fail("No data available"))
-    assert main(["run", "--limit", "1"]) == 1
+    assert main(["run", "--targets", "1"]) == 1
     assert "Import more data" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
 
@@ -399,3 +401,107 @@ def test_role_models_routes_strong_solver_by_provider(provider):
     assert roles["challenger"] == (openai_client, settings.challenger_model)
     assert roles["weak_solver"] == (openrouter, settings.weak_model)
     assert roles["judge"] == (openrouter, settings.judge_model)
+
+
+def seed_run_row(memory, run_id, **overrides):
+    row = {name: None for name in RUN_FIELDS.split(",")}
+    row |= make_settings().model_dump(include=set(RUN_FIELDS.split(",")))
+    row |= {"id": run_id, "target_offset": 0, "target_count": 1, "status": "error"} | overrides
+    memory.tables["runs"][run_id] = row
+
+
+def test_resume_skips_finished_targets_and_retries_the_rest(sample_record, sample, image_bytes):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    for ref_id in (2, 3):
+        memory.seed(sample_record.model_copy(update={"ref_id": ref_id}))
+    roles = ScriptedRoles(sample, [wrong_box()], settings=make_settings(max_rounds=1))
+    generate = roles.challenger.generate
+
+    def fail_on_second(image, target, direction, history):
+        if target.ref_id == 2:
+            raise ModelError("Challenger unavailable")
+        return generate(image, target, direction, history)
+
+    roles.challenger.generate = fail_on_second
+    summary = run_batch(store.iter_samples(2), 3, roles.main, store, cloud.drive)
+    assert summary["processed"] == 2
+    assert summary["status"] == "error"
+    assert memory.tables["runs"][store.run_id]["status"] == "error"
+    assert memory.tables["rounds"][(store.run_id, 1, 1)]["status"] == "accepted"
+    assert memory.tables["rounds"][(store.run_id, 2, 1)]["status"] == "error"
+    first_before = dict(memory.tables["rounds"][(store.run_id, 1, 1)])
+
+    resumed = SupabaseStore(memory.client, store.run_id)
+    assert resumed.finished_targets(roles.main.settings.max_rounds) == {1}
+    roles2 = ScriptedRoles(sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=1))
+    summary = run_batch(resumed.iter_samples(3), 3, roles2.main, resumed, cloud.drive, done={1})
+    assert summary["skipped"] == 1
+    assert summary["processed"] == 2
+    assert summary["status"] == "completed"
+    assert memory.tables["runs"][store.run_id]["status"] == "completed"
+    rounds = memory.tables["rounds"]
+    assert rounds[(store.run_id, 2, 1)]["status"] == "accepted"
+    assert rounds[(store.run_id, 3, 1)]["status"] == "accepted"
+    assert not [row for row in rounds.values() if row["status"] == "error"]
+    assert rounds[(store.run_id, 1, 1)] == first_before
+    assert len(roles2.main_histories) == len([key for key in rounds if key[1] in (2, 3)])
+
+
+def test_finished_targets_counts_accepted_and_last_round_rejections_only(
+    sample_record, image_bytes
+):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    max_rounds = make_settings().max_rounds
+    for ref_id, number, status in [
+        (1, 2, "accepted"),
+        (2, max_rounds, "rejected"),
+        (3, 1, "rejected"),
+        (4, 1, "error"),
+        (5, 1, "running"),
+    ]:
+        memory.tables["rounds"][(store.run_id, ref_id, number)] = {
+            "run_id": store.run_id,
+            "ref_id": ref_id,
+            "round_number": number,
+            "status": status,
+        }
+    assert store.finished_targets(max_rounds) == {1, 2}
+
+
+def test_resume_of_a_completed_run_does_nothing(sample_record, image_bytes, monkeypatch, capsys):
+    memory, cloud, _ = cloud_for(sample_record, image_bytes)
+    configure_cli(monkeypatch, memory, cloud)
+    run_id = str(UUID(int=7))
+    seed_run_row(memory, run_id, status="completed")
+    monkeypatch.setattr("main.OpenAIClient", lambda *args: pytest.fail("Nothing to resume"))
+    assert main(["run", "--resume", run_id]) == 0
+    assert "already completed" in capsys.readouterr().out
+
+
+def test_resume_refuses_a_run_made_with_different_models(
+    sample_record, image_bytes, monkeypatch, capsys
+):
+    memory, cloud, _ = cloud_for(sample_record, image_bytes)
+    configure_cli(monkeypatch, memory, cloud)
+    run_id = str(UUID(int=8))
+    seed_run_row(memory, run_id, weak_model="another/model")
+    monkeypatch.setattr("main.OpenAIClient", lambda *args: pytest.fail("Settings differ"))
+    assert main(["run", "--resume", run_id]) == 1
+    assert "different models" in capsys.readouterr().err
+
+
+def test_processing_a_target_removes_rounds_of_an_earlier_attempt(
+    sample_record, sample, image_bytes
+):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    stale = (store.run_id, sample.ref_id, 2)
+    memory.tables["rounds"][stale] = {
+        "run_id": store.run_id,
+        "ref_id": sample.ref_id,
+        "round_number": 2,
+        "status": "running",
+    }
+    roles = ScriptedRoles(sample, settings=make_settings(max_rounds=1))
+    run_batch(store.iter_samples(1), 1, roles.main, store, cloud.drive)
+    assert stale not in memory.tables["rounds"]
+    assert [row["round_number"] for row in memory.tables["rounds"].values()] == [1]

@@ -45,23 +45,23 @@ Create `.env` from [.env.example](.env.example) and configure your own services:
 | `GOOGLE_DRIVE_TOKEN_FILE` | Saved login token; default `credentials/google_token.json` |
 
 The five model settings are required and have no defaults in code. `AUTODATA_MAIN_MODEL`
-and `AUTODATA_CHALLENGER_MODEL` name OpenAI models for the main agent and the challenger.
-`AUTODATA_STRONG_MODEL` names the strong solver, an OpenRouter model unless
+and `AUTODATA_CHALLENGER_MODEL` name OpenAI models for the main agent and the
+challenger. `AUTODATA_STRONG_MODEL` names the strong solver, an OpenRouter model unless
 `AUTODATA_STRONG_PROVIDER=openai` is set. `AUTODATA_WEAK_MODEL` names the Qwen weak
-solver on OpenRouter, the checkpoint you intend to fine-tune. `AUTODATA_JUDGE_MODEL` names the OpenRouter
-vision model that reviews passing expressions for truth and uniqueness; use a family other
-than the challenger's. `run` stops with a message
-naming any missing variable, and before any paid call it checks that each provider
-offers the configured model ID. Main-agent and challenger calls run at low reasoning
-effort with an 8,000-token output cap; solver calls use greedy decoding.
-Keep `.env` and OAuth credentials private.
+solver on OpenRouter, the checkpoint you intend to fine-tune. `AUTODATA_JUDGE_MODEL`
+names the OpenRouter vision model that reviews passing expressions for truth and
+uniqueness; use a family other than the challenger's. `run` stops with a message naming
+any missing variable, and before any paid call it checks that each provider offers the
+configured model ID. Main-agent and challenger calls run at low reasoning effort with an
+8,000-token output cap; solver calls use greedy decoding. Keep `.env` and OAuth
+credentials private.
 
 ### Supabase
 
 | Table | Stores |
 | --- | --- |
 | `refcoco_annotations` | One row per annotated object: `ref_id` (primary key), COCO image ID, category, image size, ground-truth box, the human referring expressions, and the Drive file ID of its image |
-| `runs` | One row per `run` command: models, IoU thresholds, and status |
+| `runs` | One row per `run` command: models, IoU thresholds, target range, and status |
 | `rounds` | One row per loop round, keyed by run, `ref_id`, and round number: the generated referring expression, both solver boxes, IoUs, and the outcome. Rows with status `accepted` are the training examples |
 
 The schema is one SQL file per table in [supabase/](supabase/), plus the shared coordinate
@@ -79,7 +79,7 @@ python src/main.py supabase-check
    Add your account as a test user if the app is in testing mode.
 3. Save the downloaded client JSON to `credentials/google_client.json`.
 4. Create two folders named `images` and `previews` inside the project folder. The
-   code never creates folders; it only looks these two up.
+   code looks these two up and creates one subfolder per run inside `previews`.
 5. Set `GOOGLE_DRIVE_FOLDER_ID` to the project folder's ID, then sign in and check:
 
 ```powershell
@@ -122,21 +122,29 @@ After an interrupted import, rerun the same command.
 ### Generate referring expressions
 
 ```powershell
-python src/main.py run --limit 10
+python src/main.py run --targets 10
 ```
 
 Each target gets up to six rounds and stops when accepted. The command prints
 the run ID and links to round previews. Targets are processed in import order.
-Every run starts a new experiment; it does not resume an earlier run.
-A model error marks that target's round `error` with the message in `feedback`, and
-the batch continues with the next target. After three consecutive failed targets the
+A run that stops early continues under the same run ID with `--resume`: finished targets
+are skipped and unfinished ones, including those that ended in an error, are redone from
+round one, and their earlier rounds are removed.
+A rate-limited model call is retried with waits of up to a few minutes before it counts
+as an error. A model error marks that target's round `error` with the message in
+`feedback`, and the batch continues with the next target. After three consecutive failed targets the
 batch stops and the run status is `error`.
 
 | Option | Purpose |
 | --- | --- |
-| `--limit N` | Number of imported targets to process |
+| `--targets N` | Number of imported targets to process |
 | `--offset N` | Skip N targets in import order |
+| `--resume RUN_ID` | Continue an interrupted run; its target range is reused |
 | `--dry-run` | Validate cloud inputs without model calls or output writes |
+
+```powershell
+python src/main.py run --resume YOUR_RUN_UUID
+```
 
 Keep the imported set unchanged when using offsets across batches. A full round
 uses up to five model calls, the fifth only when the three checks pass: up to 300 calls for
@@ -166,7 +174,7 @@ For LLaMA-Factory, set `dataset_dir: training/my_experiment` and
 | Weak solver | Predicts a box using Qwen through OpenRouter |
 | Strong solver | Predicts a box using Qwen3-VL-235B on OpenRouter by default, or an OpenAI VLM |
 | Verifier | Calculates IoU against ground truth and applies the three accept checks |
-| Judge | Sees the marked target; rejects a passing expression whose claims are not visible or that fits another object |
+| Judge | Sees the marked target and the weak solver's choice; rejects a passing expression whose claims are not visible or that fits another object |
 
 The main agent and challenger see the target annotation. Both solvers receive only
 the clean image and generated referring expression. Rejection feedback informs the
@@ -199,11 +207,12 @@ folders you created inside the project folder:
 ```text
 Drive root/
   images/581857.jpg
-  previews/<run id> ref 0 round 1.png
+  previews/<run id>/ref 0 round 1.png
 ```
 
 `images/` holds one original per COCO image, named by its COCO image ID. `previews/`
-holds one PNG per loop round, named by run ID, RefCOCO ref ID and round number.
+holds one folder per run, with one PNG per loop round named by RefCOCO ref ID and round
+number.
 
 Round previews show the referring expression, outcome, and boxes: **green** for
 ground truth, **red** for the weak solver, and **blue** for the strong solver.
