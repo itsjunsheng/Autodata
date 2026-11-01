@@ -28,7 +28,8 @@ IMAGES_FOLDER = "images"
 PREVIEWS_FOLDER = "previews"
 ACCEPTED_FOLDER = "accepted"
 IMAGE_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-RETRY_DELAYS = (2, 5)  # seconds before the second and third attempt of a dropped request
+RETRY_DELAYS = (2, 5, 15, 30, 60)  # seconds between attempts at a dropped request
+API_RETRIES = 5  # Google's own retries per request: 5xx, 429 and dropped connections, with backoff
 
 
 class DriveError(RuntimeError):
@@ -134,7 +135,7 @@ class GoogleDrive:
     def _execute(self, request):
         try:
             with self._lock:
-                return _retry_transport(lambda: request.execute(num_retries=2), "request")
+                return _retry_transport(lambda: request.execute(num_retries=API_RETRIES), "request")
         except HttpError as error:
             raise DriveError(
                 f"Google Drive request failed (HTTP {error.resp.status}). "
@@ -271,7 +272,7 @@ class GoogleDrive:
             downloader = MediaIoBaseDownload(buffer, request)
             done = False
             while not done:
-                _, done = downloader.next_chunk(num_retries=2)
+                _, done = downloader.next_chunk(num_retries=API_RETRIES)
             return buffer.getvalue()
 
         try:

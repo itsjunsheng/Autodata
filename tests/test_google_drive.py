@@ -359,9 +359,9 @@ def test_dropped_connection_is_retried_then_the_upload_succeeds(drive_waits):
 def test_persistent_dropped_connection_reports_attempts_without_server_details(drive_waits):
     memory = MemoryDrive()
     memory.fail_transport = 10
-    with pytest.raises(DriveError, match="OSError after 3 attempts"):
+    with pytest.raises(DriveError, match="OSError after 6 attempts"):
         memory.drive.upload_image("20.png", b"png-bytes", "image/png")
-    assert drive_waits == [2, 5]
+    assert drive_waits == [2, 5, 15, 30, 60]
 
 
 def test_download_retries_a_dropped_connection(drive_waits):

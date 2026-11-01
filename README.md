@@ -131,13 +131,16 @@ Each target gets up to six rounds and stops when accepted. The command prints th
 and links to round previews. Targets are processed in import order. A run that stops
 early continues under the same run ID with `--resume`: finished targets are skipped and
 unfinished ones, including those that ended in an error, are redone from round one, and
-their earlier rounds are removed. A rate-limited model call is retried with waits of up
-to a few minutes, and a dropped Supabase or Drive request is retried twice, before
-either counts as an error. A model error marks that target's round `error` with the
-message in `feedback`, and the batch continues with the next target. After three
-consecutive failed targets the batch stops and the run status is `error`.
+their earlier rounds are removed. A rate-limited model call is retried for up to about
+twenty minutes, and a dropped or gateway-failed Supabase or Drive request for about two
+minutes, before either counts as an error. A model error marks that target's round
+`error` with the message in `feedback`, and the batch continues with the next target.
+After three consecutive failed targets the batch stops and the run status is `error`.
 
-`AUTODATA_WORKERS` in `.env` sets how many targets are curated at the same time. Each worker runs one target's rounds in order, then takes the next target in import order. Targets never share rows or files, and Drive uploads take turns across workers, so the gain flattens above about four.
+`AUTODATA_WORKERS` in `.env` sets how many targets are curated at the same time. Each
+worker runs one target's rounds in order, then takes the next target in import order.
+Targets never share rows or files, and Drive uploads take turns across workers, so the
+gain flattens above about four.
 
 | Option | Purpose |
 | --- | --- |
@@ -230,7 +233,10 @@ ground truth, **red** for the weak solver, and **blue** for the strong solver.
 Training uses the clean original images. Import and generation store their results in
 the cloud; `export` explicitly creates local training files.
 
-Run one importing process at a time. Generation runs several targets at once inside one process, and separate `run` processes on disjoint `--offset` ranges are also safe, since each run writes only its own rows and folders. Drive access follows the folder's sharing permissions.
+Run one importing process at a time. Generation runs several targets at once inside one
+process, and separate `run` processes on disjoint `--offset` ranges are also safe, since
+each run writes only its own rows and folders. Drive access follows the folder's sharing
+permissions.
 
 ## Development
 

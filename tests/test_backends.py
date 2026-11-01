@@ -531,7 +531,7 @@ def test_rate_limit_is_waited_out_and_the_call_then_succeeds(image, rate_limit_w
     router = OpenRouterClient(make_settings(), client=mock_client(respond, OPENROUTER_BASE_URL))
     prediction = Solver(router, make_settings().weak_model, "weak_solver").solve(image, "cup")
     assert prediction.bbox.as_xyxy() == [100, 200, 500, 800]
-    assert rate_limit_waits == [30]
+    assert len(rate_limit_waits) == 1 and 30 <= rate_limit_waits[0] <= 40
     assert len(calls) == 2
 
 
@@ -545,5 +545,8 @@ def test_persistent_rate_limit_fails_after_bounded_waits(image, rate_limit_waits
     router = OpenRouterClient(make_settings(), client=mock_client(respond, OPENROUTER_BASE_URL))
     with pytest.raises(ModelError, match="RateLimitError"):
         Solver(router, make_settings().weak_model, "weak_solver").solve(image, "cup")
-    assert rate_limit_waits == [30, 60, 120]
-    assert len(calls) == 4
+    assert len(rate_limit_waits) == 5
+    assert all(
+        base <= wait <= base + 10 for base, wait in zip((30, 60, 120, 300, 600), rate_limit_waits)
+    )
+    assert len(calls) == 6

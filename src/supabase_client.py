@@ -34,7 +34,10 @@ RUN_FIELDS = (
     "id,main_model,challenger_model,weak_model,strong_model,judge_model,iou_threshold,"
     "min_iou_gap,max_rounds,target_offset,target_count,status,finished_at"
 )
-RETRY_DELAYS = (2, 5)  # seconds before the second and third attempt of a timed-out request
+RETRY_DELAYS = (2, 5, 15, 30, 60)  # seconds between attempts at a failed request
+# A gateway reply (numeric status) or PostgREST losing its database connection, pool or schema
+# cache (PGRST000-003): transient, unlike a rejection from Postgres itself.
+TRANSIENT_CODES = {"500", "502", "503", "504", "PGRST000", "PGRST001", "PGRST002", "PGRST003"}
 
 
 class SupabaseError(RuntimeError):
@@ -70,23 +73,24 @@ def create_supabase_client() -> Client:
 
 
 def _execute(query, operation: str):
-    # Retry transport failures only; a database rejection is deterministic and reports its code.
-    # Messages carry no server text, which could echo the key.
+    # Retry transport failures and transient server errors; a database rejection is
+    # deterministic and reports its code. Messages carry no server text, which could echo the key.
     for delay in (*RETRY_DELAYS, None):
         try:
             return query.execute()
         except APIError as error:
-            raise SupabaseError(
-                f"Supabase could not {operation} (error code {error.code}); "
-                "check the schema and access."
-            ) from error
+            if delay is None or str(error.code) not in TRANSIENT_CODES:
+                raise SupabaseError(
+                    f"Supabase could not {operation} (error code {error.code}); "
+                    "check the schema and access."
+                ) from error
         except httpx.HTTPError as error:
             if delay is None:
                 raise SupabaseError(
                     f"Supabase could not {operation} ({type(error).__name__} after "
                     f"{len(RETRY_DELAYS) + 1} attempts); check connectivity."
                 ) from error
-            sleep(delay)
+        sleep(delay)
 
 
 def check_supabase_connection(client: Client) -> dict:

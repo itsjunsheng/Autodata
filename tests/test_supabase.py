@@ -39,6 +39,7 @@ class MemorySupabase:
         self.fail_round_write = False
         self.fail_annotation_write = False
         self.timeout_writes = 0
+        self.gateway_errors = 0
         self.client = mock_client(self.respond)
 
     def seed(self, record):
@@ -95,6 +96,9 @@ class MemorySupabase:
         if self.timeout_writes:
             self.timeout_writes -= 1
             raise httpx.ReadTimeout("timed out", request=request)
+        if self.gateway_errors:
+            self.gateway_errors -= 1
+            return httpx.Response(502, text="<html>bad gateway</html>")
         if (self.fail_round_write and table == "rounds") or (
             self.fail_annotation_write and table == "refcoco_annotations"
         ):
@@ -217,7 +221,18 @@ def test_persistent_write_timeout_names_the_failure_without_the_key(monkeypatch)
         SupabaseStore(memory.client).start(make_settings(), 0, 1)
     assert "ReadTimeout" in str(error.value)
     assert TEST_KEY not in str(error.value)
-    assert delays == [2, 5]
+    assert delays == [2, 5, 15, 30, 60]
+
+
+def test_gateway_error_is_retried_then_the_write_succeeds(monkeypatch):
+    memory = MemorySupabase()
+    memory.gateway_errors = 1
+    delays = []
+    monkeypatch.setattr(supabase_client, "sleep", delays.append)
+    store = SupabaseStore(memory.client)
+    store.start(make_settings(), 0, 1)
+    assert memory.tables["runs"][store.run_id]["status"] == "running"
+    assert delays == [2]
 
 
 def test_database_rejection_is_not_retried_and_reports_its_code(monkeypatch, sample_record):

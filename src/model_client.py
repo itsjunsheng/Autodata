@@ -2,6 +2,7 @@
 
 import base64
 import os
+import random
 import re
 from io import BytesIO
 from time import sleep
@@ -13,7 +14,8 @@ from pydantic import BaseModel, ValidationError
 
 from models import Settings
 
-RATE_LIMIT_WAITS = (30, 60, 120)  # seconds; a provider's shared-pool throttle lasts minutes
+RATE_LIMIT_WAITS = (30, 60, 120, 300, 600)  # seconds; a provider's throttle can last many minutes
+RATE_LIMIT_JITTER = 10  # seconds; spreads the retries of parallel workers so they stop colliding
 
 
 class ModelError(RuntimeError):
@@ -29,8 +31,9 @@ def _wait_out_rate_limits(role: str, request):
         except RateLimitError:
             if wait is None:
                 raise
-            print(f"{role}: rate limited; waiting {wait}s before retrying.", flush=True)
-            sleep(wait)
+            pause = wait + random.uniform(0, RATE_LIMIT_JITTER)
+            print(f"{role}: rate limited; waiting {pause:.0f}s before retrying.", flush=True)
+            sleep(pause)
 
 
 def api_error_message(error: APIError, role: str, model: str) -> str:
@@ -186,7 +189,7 @@ class OpenRouterClient:
                 base_url=OPENROUTER_BASE_URL,
                 api_key=key,
                 timeout=120.0,
-                max_retries=6,
+                max_retries=5,
             )
         self.client = client
         self._catalogue: dict | None = None
