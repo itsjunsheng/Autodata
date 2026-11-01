@@ -52,7 +52,7 @@ solver on OpenRouter, the checkpoint you intend to fine-tune. `AUTODATA_JUDGE_MO
 names the OpenRouter vision model that reviews passing expressions for truth and
 uniqueness; use a family other than the challenger's. `run` stops with a message naming
 any missing variable, and before any paid call it checks that each provider offers the
-configured model ID. Main-agent and challenger calls run at low reasoning effort with an
+configured model ID. Main-agent and challenger calls run at medium reasoning effort with an
 8,000-token output cap; solver calls use greedy decoding. Keep `.env` and OAuth
 credentials private.
 

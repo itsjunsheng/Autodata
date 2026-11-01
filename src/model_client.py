@@ -151,9 +151,9 @@ class OpenAIClient:
                     instructions=instructions or NOT_GIVEN,
                     input=[{"role": "user", "content": content}],
                     text_format=schema,
-                    # Low effort: reasoning tokens bill as output, and these roles need a brief
-                    # diagnosis, not a long deliberation.
-                    reasoning={"effort": "low"},
+                    # Medium effort: reasoning tokens bill as output and count toward
+                    # max_output_tokens.
+                    reasoning={"effort": "medium"},
                     max_output_tokens=self.settings.max_output_tokens,
                     store=False,
                 ),
