@@ -218,6 +218,8 @@ class Settings(StrictModel):
     min_iou_gap: float = Field(default=0.2, ge=0, le=1)
     # Reasoning tokens count toward this cap; an exhausted cap is an incomplete response.
     max_output_tokens: int = Field(default=8000, ge=256)
+    # Targets curated at the same time; each target's rounds stay sequential.
+    workers: int = Field(default=1, ge=1, le=8)
 
     @classmethod
     def from_env(cls, **overrides: object) -> "Settings":
@@ -235,6 +237,9 @@ class Settings(StrictModel):
         provider = os.getenv("AUTODATA_STRONG_PROVIDER", "").strip().lower()
         if provider:
             models["strong_provider"] = provider
+        workers = os.getenv("AUTODATA_WORKERS", "").strip()
+        if workers:
+            models["workers"] = workers
         return cls(**(models | overrides))
 
 

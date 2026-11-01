@@ -38,6 +38,7 @@ Create `.env` from [.env.example](.env.example) and configure your own services:
 | --- | --- |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `OPENROUTER_API_KEY` | OpenRouter API key |
+| `AUTODATA_WORKERS` | Targets curated at the same time, 1 to 8; default 1 |
 | `SUPABASE_URL` | Your Supabase project's API URL |
 | `SUPABASE_API_KEY` | Backend secret key or legacy `service_role` key |
 | `GOOGLE_DRIVE_FOLDER_ID` | ID of the Drive folder used by this project |
@@ -136,6 +137,8 @@ either counts as an error. A model error marks that target's round `error` with 
 message in `feedback`, and the batch continues with the next target. After three
 consecutive failed targets the batch stops and the run status is `error`.
 
+`AUTODATA_WORKERS` in `.env` sets how many targets are curated at the same time. Each worker runs one target's rounds in order, then takes the next target in import order. Targets never share rows or files, and Drive uploads take turns across workers, so the gain flattens above about four.
+
 | Option | Purpose |
 | --- | --- |
 | `--targets N` | Number of imported targets to process |
@@ -227,8 +230,7 @@ ground truth, **red** for the weak solver, and **blue** for the strong solver.
 Training uses the clean original images. Import and generation store their results in
 the cloud; `export` explicitly creates local training files.
 
-Run one importing or generating process at a time; file creation is not coordinated
-across workers. Drive access follows the folder's sharing permissions.
+Run one importing process at a time. Generation runs several targets at once inside one process, and separate `run` processes on disjoint `--offset` ranges are also safe, since each run writes only its own rows and folders. Drive access follows the folder's sharing permissions.
 
 ## Development
 

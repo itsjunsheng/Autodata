@@ -121,7 +121,6 @@ class SupabaseStore:
     def __init__(self, client: Client, run_id: str | None = None):
         self.client = client
         self.run_id = run_id or str(uuid4())
-        self.saved_rounds: dict[tuple[int, int], dict] = {}
 
     def save_annotation(self, record: AnnotationRecord) -> None:
         _execute(
@@ -236,7 +235,6 @@ class SupabaseStore:
     def save_round(self, result: Result, status: str, preview_file_id: str | None = None) -> None:
         # Checkpoint a loop; an accepted round is the accepted example.
         current = result.rounds[-1]
-        key = (result.sample.ref_id, current.number)
         row = {
             "run_id": self.run_id,
             "ref_id": result.sample.ref_id,
@@ -252,12 +250,10 @@ class SupabaseStore:
             "feedback": result.error if status == "error" else current.feedback,
             "preview_file_id": preview_file_id,
         }
-        if self.saved_rounds.get(key) != row:
-            _execute(
-                self.client.table("rounds").upsert(row, on_conflict="run_id,ref_id,round_number"),
-                "save the round",
-            )
-            self.saved_rounds[key] = row
+        _execute(
+            self.client.table("rounds").upsert(row, on_conflict="run_id,ref_id,round_number"),
+            "save the round",
+        )
 
     def finish(self, status: str) -> None:
         _execute(

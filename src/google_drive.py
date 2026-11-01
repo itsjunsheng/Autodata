@@ -5,6 +5,7 @@
 import hashlib
 import os
 import re
+import threading
 from io import BytesIO
 from pathlib import Path
 from time import sleep
@@ -127,10 +128,13 @@ class GoogleDrive:
         self.files = service.files()
         self.folder_id = validate_file_id(folder_id)
         self.folders: dict[str, str] = {}
+        # httplib2 is not thread-safe, so Drive requests take turns across worker threads.
+        self._lock = threading.Lock()
 
     def _execute(self, request):
         try:
-            return _retry_transport(lambda: request.execute(num_retries=2), "request")
+            with self._lock:
+                return _retry_transport(lambda: request.execute(num_retries=2), "request")
         except HttpError as error:
             raise DriveError(
                 f"Google Drive request failed (HTTP {error.resp.status}). "
@@ -271,6 +275,7 @@ class GoogleDrive:
             return buffer.getvalue()
 
         try:
-            return _retry_transport(fetch, "download")
+            with self._lock:
+                return _retry_transport(fetch, "download")
         except HttpError as error:
             raise DriveError(f"Google Drive download failed (HTTP {error.resp.status}).") from error

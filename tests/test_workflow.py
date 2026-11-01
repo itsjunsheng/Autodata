@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from uuid import UUID
@@ -144,8 +145,6 @@ def test_previews_are_named_by_ref_id_and_do_not_overwrite_shared_images(
     ]
     assert len({row["preview_file_id"] for row in saved}) == 3
     assert [row["round_number"] for row in saved] == [1, 2, 1]
-    downloads = [uri for method, uri in cloud.requests if method == "GET" and "alt=media" in uri]
-    assert len(downloads) == 1
 
 
 def test_no_accepted_round_keeps_rounds_rejected_and_export_empty(
@@ -213,8 +212,6 @@ def test_model_failure_is_recorded_and_the_batch_continues(sample_record, sample
     assert saved[0]["preview_file_id"]
     assert memory.tables["runs"][store.run_id]["status"] == "completed"
     assert len(accepted_rounds(memory)) == 1
-    downloads = [uri for method, uri in cloud.requests if method == "GET" and "alt=media" in uri]
-    assert len(downloads) == 1
 
 
 def test_three_consecutive_failed_targets_stop_the_batch(sample_record, sample, image_bytes):
@@ -234,6 +231,27 @@ def test_three_consecutive_failed_targets_stop_the_batch(sample_record, sample, 
     assert memory.tables["runs"][store.run_id]["status"] == "error"
     saved = list(memory.tables["rounds"].values())
     assert [row["status"] for row in saved] == ["error"] * 3
+
+
+def test_workers_curate_targets_at_the_same_time(sample_record, sample, image_bytes):
+    memory, cloud, store = cloud_for(sample_record, image_bytes)
+    memory.seed(sample_record.model_copy(update={"ref_id": 2}))
+    roles = ScriptedRoles(
+        sample, [wrong_box(), wrong_box()], settings=make_settings(max_rounds=1, workers=2)
+    )
+    both_started = threading.Barrier(2, timeout=5)
+    solve = roles.weak_solver.solve
+
+    def solve_once_both_targets_started(image, referring_expression):
+        both_started.wait()
+        return solve(image, referring_expression)
+
+    roles.weak_solver.solve = solve_once_both_targets_started
+    summary = run_batch(store.iter_samples(2), 2, roles.main, store, cloud.drive)
+    assert summary["accepted"] == 2 and summary["status"] == "completed"
+    assert [row["status"] for row in memory.tables["rounds"].values()] == ["accepted", "accepted"]
+    run_folders = [row for row in cloud.folder_creates if row["name"] == store.run_id]
+    assert len(run_folders) == 2
 
 
 @pytest.mark.parametrize("failure", ["image", "database"])

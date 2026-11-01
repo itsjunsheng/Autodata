@@ -3,8 +3,10 @@
 import argparse
 import json
 import sys
+import threading
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
@@ -40,6 +42,33 @@ from verifier import Verifier
 MAX_CONSECUTIVE_ERRORS = 3
 
 
+class BatchStopped(Exception):
+    # Raised at a worker's next checkpoint once the batch is stopping. Nothing catches it:
+    # the future holding it is discarded when the pool shuts down.
+    pass
+
+
+def curate_all(
+    pool: ThreadPoolExecutor,
+    samples: list[Sample],
+    curate: Callable[[Sample], Result],
+    workers: int,
+    stop: threading.Event,
+) -> Iterator[Result]:
+    # Keep up to `workers` targets in flight and yield each result as its target finishes.
+    pending: set[Future] = set()
+    for sample in samples:
+        if len(pending) == workers:
+            ready, pending = wait(pending, return_when=FIRST_COMPLETED)
+            yield from (future.result() for future in ready)
+            if stop.is_set():
+                return
+        pending.add(pool.submit(curate, sample))
+    while pending and not stop.is_set():
+        ready, pending = wait(pending, return_when=FIRST_COMPLETED)
+        yield from (future.result() for future in ready)
+
+
 def run_batch(
     samples: Iterable[Sample],
     requested: int,
@@ -50,65 +79,70 @@ def run_batch(
     offset: int = 0,
     done: frozenset[int] | set[int] = frozenset(),
 ) -> dict:
-    # Process one target at a time, downloading each distinct image once.
-    # Checkpoint partial rounds and final previews.
+    # Curate up to settings.workers targets at once; each target's rounds stay sequential.
     counts = Counter()
     processed = rounds = consecutive_errors = skipped = 0
-    previous_file_id = None
-    image = None
+    stop = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=main_agent.settings.workers)
     print(f"Supabase run ID: {store.run_id}", flush=True)
+
+    def curate(sample: Sample) -> Result:
+        store.clear_rounds(sample.ref_id)
+        image = load_image(drive.download(sample.image_file_id), sample.width, sample.height)
+        completed_rounds = set()
+
+        def checkpoint(result: Result) -> None:
+            if stop.is_set():
+                raise BatchStopped
+            if not result.rounds:
+                return
+            latest = result.rounds[-1]
+            status = round_status(result, latest)
+            if status == "running":
+                store.save_round(result, status)
+            elif latest.number not in completed_rounds:
+                preview = render_round_preview(image, sample, latest, status)
+                buffer = BytesIO()
+                preview.save(buffer, format="PNG")
+                name = f"ref {sample.ref_id} round {latest.number}.png"
+                file_id = drive.upload(
+                    folders[PREVIEWS_FOLDER], name, buffer.getvalue(), "image/png"
+                )
+                if status == "accepted":
+                    # A second copy for auditing by hand, in accepted/<run id>/.
+                    drive.upload(folders[ACCEPTED_FOLDER], name, buffer.getvalue(), "image/png")
+                store.save_round(result, status, file_id)
+                completed_rounds.add(latest.number)
+                print(f"  ref {sample.ref_id} round {latest.number}: {status}", flush=True)
+                print(
+                    f"  ref {sample.ref_id} preview: https://drive.google.com/file/d/{file_id}/view",
+                    flush=True,
+                )
+
+        print(f"Curating ref {sample.ref_id}", flush=True)
+        return main_agent.run(sample, image, checkpoint)
+
     try:
         store.start(main_agent.settings, offset, requested)
-        previews = drive.run_folder(PREVIEWS_FOLDER, store.run_id)
+        folders = {
+            name: drive.run_folder(name, store.run_id)
+            for name in (PREVIEWS_FOLDER, ACCEPTED_FOLDER)
+        }
+        queued = []
         for sample in samples:
             if sample.ref_id in done:
                 skipped += 1
-                continue
-            store.clear_rounds(sample.ref_id)
-            if sample.image_file_id != previous_file_id:
-                image = load_image(
-                    drive.download(sample.image_file_id), sample.width, sample.height
-                )
-                previous_file_id = sample.image_file_id
-            print(
-                f"[{processed + skipped + 1}/{requested}] Curating ref {sample.ref_id}", flush=True
-            )
-            if image is None or image.size != (sample.width, sample.height):
-                raise ValueError("Image dimensions disagree with the grounding annotation.")
-            # Keep only this target's checkpoint cache, even in very large runs.
-            store.saved_rounds.clear()
-            completed_rounds = set()
-
-            def checkpoint(result: Result) -> None:
-                if not result.rounds:
-                    return
-                latest = result.rounds[-1]
-                status = round_status(result, latest)
-                if status == "running":
-                    store.save_round(result, status)
-                elif latest.number not in completed_rounds:
-                    preview = render_round_preview(image, sample, latest, status)
-                    buffer = BytesIO()
-                    preview.save(buffer, format="PNG")
-                    name = f"ref {sample.ref_id} round {latest.number}.png"
-                    file_id = drive.upload(previews, name, buffer.getvalue(), "image/png")
-                    if status == "accepted":
-                        # A second copy for auditing by hand, in accepted/<run id>/.
-                        accepted = drive.run_folder(ACCEPTED_FOLDER, store.run_id)
-                        drive.upload(accepted, name, buffer.getvalue(), "image/png")
-                    store.save_round(result, status, file_id)
-                    completed_rounds.add(latest.number)
-                    print(f"  Round {latest.number}: {status}", flush=True)
-                    print(
-                        f"  Round preview: https://drive.google.com/file/d/{file_id}/view",
-                        flush=True,
-                    )
-
-            result = main_agent.run(sample, image, checkpoint)
+            else:
+                queued.append(sample)
+        for result in curate_all(pool, queued, curate, main_agent.settings.workers, stop):
             processed += 1
             rounds += len(result.rounds)
             counts[result.status] += 1
-            print(f"  {result.status} after {len(result.rounds)} round(s)", flush=True)
+            print(
+                f"[{processed + skipped}/{requested}] ref {result.sample.ref_id}: "
+                f"{result.status} after {len(result.rounds)} round(s)",
+                flush=True,
+            )
             if result.status == "error":
                 print(f"  Recorded error: {result.error}", flush=True)
                 consecutive_errors += 1
@@ -118,7 +152,7 @@ def run_batch(
                         "Check the provider and rerun.",
                         flush=True,
                     )
-                    break
+                    stop.set()
             else:
                 consecutive_errors = 0
         status = "completed" if processed + skipped == requested else "error"
@@ -136,11 +170,14 @@ def run_batch(
             "run_id": store.run_id,
         }
     except (SupabaseError, DriveError, OSError, ValueError, KeyboardInterrupt):
+        stop.set()
         try:
             store.finish("error")
         except SupabaseError:
             print("Could not mark the run as failed in Supabase.", file=sys.stderr)
         raise
+    finally:
+        pool.shutdown(cancel_futures=True)
 
 
 def role_models(
@@ -288,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Strong solver: {settings.strong_provider} / {settings.strong_model}")
         print(f"Weak solver: openrouter / {settings.weak_model}")
+        print(f"Workers: {settings.workers}")
         print(f"Maximum {count * settings.max_rounds * 5} model calls, excluding retries.")
         summary = run_batch(samples, count, agent, store, drive, offset=offset, done=done)
         print(json.dumps(summary, indent=2))

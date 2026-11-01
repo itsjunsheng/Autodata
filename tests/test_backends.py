@@ -4,7 +4,7 @@ from io import BytesIO
 
 import httpx
 import pytest
-from conftest import make_settings
+from conftest import TEST_MODELS, make_settings
 from openai import OpenAI
 from PIL import Image
 from pydantic import ValidationError
@@ -484,6 +484,18 @@ def test_direction_text_limits_still_apply_after_parsing():
         ChallengerDirection(assessment="x" * 1001, challenger_prompt="ok")
     with pytest.raises(ValidationError):
         ChallengerDirection(assessment="ok", challenger_prompt="x" * 1601)
+
+
+def test_workers_setting_comes_from_env(monkeypatch):
+    for role, model in TEST_MODELS.items():
+        monkeypatch.setenv(f"AUTODATA_{role.removesuffix('_model').upper()}_MODEL", model)
+    monkeypatch.delenv("AUTODATA_WORKERS", raising=False)
+    assert Settings.from_env().workers == 1
+    monkeypatch.setenv("AUTODATA_WORKERS", "3")
+    assert Settings.from_env().workers == 3
+    monkeypatch.setenv("AUTODATA_WORKERS", "0")
+    with pytest.raises(ValueError):
+        Settings.from_env()
 
 
 def test_model_ids_come_from_env_with_no_defaults(monkeypatch):
