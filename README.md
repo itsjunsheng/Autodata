@@ -148,8 +148,9 @@ python src/main.py run --resume YOUR_RUN_UUID
 ```
 
 Keep the imported set unchanged when using offsets across batches. A full round
-uses up to five model calls, the fifth only when the three checks pass: up to 300 calls for
-10 targets and six rounds, excluding retries.
+uses up to five model calls. The strong solver runs only when the weak solver fails, and the
+judge only when the three checks pass. That is up to 300 calls for 10 targets and six rounds,
+excluding retries.
 
 ### Export training data
 
@@ -190,6 +191,9 @@ A round is accepted only when all three conditions hold:
 - Strong-solver IoU ≥ `0.5`.
 - Weak-solver IoU < `0.5`.
 - Strong-solver IoU − weak-solver IoU ≥ `0.2`.
+
+The weak solver answers first. A round it solves is rejected as too easy without calling the
+strong solver.
 
 The threshold, the gap and the round limit are defaults on `Settings` in `models.py`.
 

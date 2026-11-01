@@ -95,12 +95,12 @@ def test_rejection_feedback_changes_next_generation_and_stops_on_accept(sample, 
     assert len(result.rounds) == 2
     assert "Too easy" in roles.main_histories[1][0]["feedback"]
     assert roles.main_histories[1][0]["weak_iou"] == 1
-    assert roles.main_histories[1][0]["strong_iou"] == 1
+    assert roles.main_histories[1][0]["strong_iou"] is None
     assert "Too easy" in roles.directions[1].challenger_prompt
     assert result.rounds[1].direction == roles.directions[1]
     assert result.rounds[-1].strong_iou == 1
     assert result.rounds[-1].weak_iou == 0
-    assert len(roles.solve_calls) == 4
+    assert [role for _, role in roles.solve_calls] == ["weak", "weak", "strong"]
     assert checkpoints[-1]["status"] == "accepted"
 
 
@@ -122,7 +122,7 @@ def test_repeated_referring_expression_is_evaluated_on_every_round(sample, image
     result = roles.main.run(sample, image, lambda _: None)
     assert result.status == "accepted"
     assert len(result.rounds) == 2
-    assert len(roles.solve_calls) == 4
+    assert len(roles.solve_calls) == 3
     assert all(text == "the cup on the left" for text, _ in roles.solve_calls)
 
 
@@ -154,10 +154,12 @@ def test_round_accepted_only_when_all_three_checks_pass(weak, strong, accepted):
     assert decide(current, make_settings())[0] is accepted
 
 
-def test_verifier_requires_both_scores_and_reports_a_strong_miss():
+def test_verifier_requires_the_scores_it_needs_and_reports_a_strong_miss():
     verifier = Verifier(make_settings())
-    with pytest.raises(ValueError, match="Both solvers"):
+    with pytest.raises(ValueError, match="weak solver"):
         verifier.evaluate(Round(number=1, strong_iou=1))
+    with pytest.raises(ValueError, match="strong solver"):
+        verifier.evaluate(Round(number=1, weak_iou=0))
     accepted, feedback = verifier.evaluate(Round(number=1, weak_iou=0, strong_iou=0.49))
     assert not accepted
     assert "Strong solver missed" in feedback
@@ -223,6 +225,15 @@ def test_judge_is_not_called_for_a_round_the_verifier_rejects(sample, image):
     assert result.status == "exhausted"
     assert roles.judge_calls == 0
     assert result.rounds[0].judge is None
+
+
+def test_strong_solver_is_skipped_when_the_weak_solver_finds_the_target(sample, image):
+    roles = ScriptedRoles(sample, settings=make_settings(max_rounds=1))
+    result = roles.main.run(sample, image, lambda _: None)
+    assert result.status == "exhausted"
+    assert [role for _, role in roles.solve_calls] == ["weak"]
+    assert result.rounds[0].strong is None and result.rounds[0].strong_iou is None
+    assert result.rounds[0].feedback.startswith("Too easy")
 
 
 def test_judge_model_error_is_recorded_as_an_error(sample, image):

@@ -21,10 +21,11 @@ solver localises it and the weak solver does not.
 
 You receive: the image; the target coordinates; the human referring expressions; and every
 previous round for this target, with its expression, both solver boxes, their IoUs, the
-verifier's decision, and the judge's verdict when there was one. The verifier is deterministic
-and compares IoUs only. The judge sees the target drawn on the image and rejects only a claim
-the image contradicts or an expression that fits another object just as well. All boxes use
-normalised XYXY coordinates on a 0-1000 scale.
+verifier's decision, and the judge's verdict when there was one. The strong solver runs only
+when the weak solver fails, so a round the weak solver solved has no strong box. The verifier is
+deterministic and compares IoUs only. The judge sees the target drawn on the image and rejects
+only a claim the image contradicts or an expression that fits another object just as well. All
+boxes use normalised XYXY coordinates on a 0-1000 scale.
 
 How to guide:
 - First round: choose a visible cue or relation for the challenger to build on.
@@ -110,14 +111,15 @@ class MainAgent:
                 current.candidate = candidate
                 checkpoint(result)
 
-                # Every generated referring expression goes directly to both solvers.
+                # A too-easy round is rejected whatever the strong solver finds, so skip the call.
                 current.weak = self.weak_solver.solve(image, candidate.referring_expression)
                 current.weak_iou = self.verifier.score(current.weak, sample.target)
                 checkpoint(result)
-                current.strong = self.strong_solver.solve(image, candidate.referring_expression)
-                current.strong_iou = self.verifier.score(current.strong, sample.target)
+                if not self.verifier.too_easy(current):
+                    current.strong = self.strong_solver.solve(image, candidate.referring_expression)
+                    current.strong_iou = self.verifier.score(current.strong, sample.target)
 
-                # Both predictions and the verifier's decision inform the next main-agent call.
+                # The predictions and the verifier's decision inform the next main-agent call.
                 accepted, feedback = self.verifier.evaluate(current)
                 if accepted:
                     # Only rounds the solvers already separated are worth a judge call.

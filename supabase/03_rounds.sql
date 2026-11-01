@@ -1,6 +1,7 @@
 -- One row per round of the agent loop: the generated referring expression, both solver
 -- boxes, their IoUs, and the verifier's outcome. Predictions may be null while running or
--- after a provider error. An accepted example is the accepted round plus its annotation.
+-- after a provider error; the strong prediction is also null when the weak solver already
+-- found the target. An accepted example is the accepted round plus its annotation.
 -- Run after 01_refcoco_annotations.sql and 02_runs.sql.
 begin;
 
@@ -22,10 +23,11 @@ create table public.rounds (
     check (
         status not in ('accepted', 'rejected') or (
             referring_expression is not null
-            and weak_bbox_2d is not null and strong_bbox_2d is not null
+            and weak_bbox_2d is not null
             and preview_file_id is not null
         )
     ),
+    check (status <> 'accepted' or strong_bbox_2d is not null),
     primary key (run_id, ref_id, round_number)
 );
 

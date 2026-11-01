@@ -15,12 +15,14 @@ def iou(first: Box, second: Box) -> float:
 
 def decide(current: Round, settings: Settings) -> tuple[bool, str]:
     # Compare measured scores with fixed thresholds; never judge the referring expression.
-    if current.strong_iou is None or current.weak_iou is None:
-        raise ValueError("Both solvers must be evaluated before a decision.")
-    if current.strong_iou < settings.iou_threshold:
-        return False, "Strong solver missed the target. Clarify visible distinguishing details."
+    if current.weak_iou is None:
+        raise ValueError("The weak solver must be evaluated before a decision.")
     if current.weak_iou >= settings.iou_threshold:
         return False, "Too easy for the weak solver. Try a different meaningful visible relation."
+    if current.strong_iou is None:
+        raise ValueError("The strong solver must be evaluated when the weak solver fails.")
+    if current.strong_iou < settings.iou_threshold:
+        return False, "Strong solver missed the target. Clarify visible distinguishing details."
     if current.strong_iou - current.weak_iou < settings.min_iou_gap:
         return False, "Insufficient solver gap. Try a different visible description of the target."
     return True, "Strong-solver IoU passed; weak-solver IoU failed; required IoU gap passed."
@@ -33,6 +35,9 @@ class Verifier:
     @staticmethod
     def score(prediction: Prediction, target: Box) -> float:
         return iou(prediction.bbox, target)
+
+    def too_easy(self, current: Round) -> bool:
+        return current.weak_iou >= self.settings.iou_threshold
 
     def evaluate(self, current: Round) -> tuple[bool, str]:
         return decide(current, self.settings)

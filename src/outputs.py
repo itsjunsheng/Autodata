@@ -40,8 +40,8 @@ def render_round_preview(
     font = ImageFont.load_default(size=14)
     legends = [
         ("lime", "Ground"),
-        ("red", "Weak solver" + (" (unavailable)" if current.weak is None else "")),
-        ("blue", "Strong solver" + (" (unavailable)" if current.strong is None else "")),
+        ("red", "Weak solver" + (" (not run)" if current.weak is None else "")),
+        ("blue", "Strong solver" + (" (not run)" if current.strong is None else "")),
     ]
     legend_width = sum(20 + font.getlength(label) + 24 for _, label in legends)
     canvas_width = max(image.width, 400, int(legend_width + font.getlength(status.upper())) + 24)

@@ -122,7 +122,8 @@ def test_rejected_and_accepted_rounds_have_separate_previews(sample_record, samp
     run_batch(store.iter_samples(1), 1, roles.main, store, cloud.drive)
     saved = list(memory.tables["rounds"].values())
     assert [row["status"] for row in saved] == ["rejected", "accepted"]
-    assert saved[0]["weak_iou"] == saved[0]["strong_iou"] == 1
+    assert saved[0]["weak_iou"] == 1
+    assert saved[0]["strong_iou"] is None and saved[0]["strong_bbox_2d"] is None
     assert saved[1]["weak_iou"] == 0
     assert len({row["preview_file_id"] for row in saved}) == 2
     assert len(accepted_rounds(memory)) == 1
