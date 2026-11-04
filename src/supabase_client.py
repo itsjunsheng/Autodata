@@ -32,7 +32,7 @@ RUN_SETTINGS = frozenset(
 )
 RUN_FIELDS = (
     "id,main_model,challenger_model,weak_model,strong_model,judge_model,iou_threshold,"
-    "min_iou_gap,max_rounds,target_offset,target_count,status,finished_at"
+    "min_iou_gap,max_rounds,target_offset,target_count,workers,status,finished_at"
 )
 RETRY_DELAYS = (2, 5, 15, 30, 60)  # seconds between attempts at a failed request
 # A gateway reply (numeric status) or PostgREST losing its database connection, pool or schema
@@ -100,7 +100,7 @@ def check_supabase_connection(client: Client) -> dict:
         "runs": RUN_FIELDS,
         "rounds": (
             "run_id,ref_id,round_number,referring_expression,weak_bbox_2d,"
-            "strong_bbox_2d,weak_iou,strong_iou,status,feedback,preview_file_id"
+            "strong_bbox_2d,weak_iou,strong_iou,status,feedback,accepted_file_id"
         ),
     }
     issues = []
@@ -191,6 +191,7 @@ class SupabaseStore:
                     **settings.model_dump(include=RUN_SETTINGS),
                     "target_offset": offset,
                     "target_count": count,
+                    "workers": settings.workers,
                     "status": "running",
                 },
                 on_conflict="id",
@@ -236,8 +237,8 @@ class SupabaseStore:
                 return done
             offset += len(rows)
 
-    def save_round(self, result: Result, status: str, preview_file_id: str | None = None) -> None:
-        # Checkpoint a loop; an accepted round is the accepted example.
+    def save_round(self, result: Result, status: str, accepted_file_id: str | None = None) -> None:
+        # Checkpoint a loop; an accepted round is the accepted example and names its Drive PNG.
         current = result.rounds[-1]
         row = {
             "run_id": self.run_id,
@@ -252,7 +253,7 @@ class SupabaseStore:
             "strong_iou": current.strong_iou,
             "status": status,
             "feedback": result.error if status == "error" else current.feedback,
-            "preview_file_id": preview_file_id,
+            "accepted_file_id": accepted_file_id,
         }
         _execute(
             self.client.table("rounds").upsert(row, on_conflict="run_id,ref_id,round_number"),

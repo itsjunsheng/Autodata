@@ -7,7 +7,6 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
@@ -18,7 +17,6 @@ from challenger import Challenger
 from dataset import load_image
 from google_drive import (
     ACCEPTED_FOLDER,
-    PREVIEWS_FOLDER,
     DriveError,
     GoogleDrive,
     authenticate_drive,
@@ -28,7 +26,7 @@ from judge import Judge
 from main_agent import MainAgent
 from model_client import ModelClient, ModelError, OpenAIClient, OpenRouterClient
 from models import Result, Sample, Settings
-from outputs import export_training, render_round_preview, round_status
+from outputs import export_training, render_accepted, round_status
 from solver import Solver
 from supabase_client import (
     RUN_SETTINGS,
@@ -101,33 +99,24 @@ def run_batch(
             if status == "running":
                 store.save_round(result, status)
             elif latest.number not in completed_rounds:
-                preview = render_round_preview(image, sample, latest, status)
-                buffer = BytesIO()
-                preview.save(buffer, format="PNG")
-                name = f"ref {sample.ref_id} round {latest.number}.png"
-                file_id = drive.upload(
-                    folders[PREVIEWS_FOLDER], name, buffer.getvalue(), "image/png"
-                )
+                file_id = None
                 if status == "accepted":
-                    # A second copy for auditing by hand, in accepted/<run id>/.
-                    drive.upload(folders[ACCEPTED_FOLDER], name, buffer.getvalue(), "image/png")
+                    # Only accepted rounds reach Drive, as accepted/<run id>/ref N round M.png.
+                    name = f"ref {sample.ref_id} round {latest.number}.png"
+                    png = render_accepted(image, sample, latest)
+                    file_id = drive.upload(accepted_folder, name, png, "image/png")
                 store.save_round(result, status, file_id)
                 completed_rounds.add(latest.number)
                 print(f"  ref {sample.ref_id} round {latest.number}: {status}", flush=True)
-                print(
-                    f"  ref {sample.ref_id} preview: https://drive.google.com/file/d/{file_id}/view",
-                    flush=True,
-                )
+                if file_id:
+                    print(f"  https://drive.google.com/file/d/{file_id}/view", flush=True)
 
         print(f"Curating ref {sample.ref_id}", flush=True)
         return main_agent.run(sample, image, checkpoint)
 
     try:
         store.start(main_agent.settings, offset, requested)
-        folders = {
-            name: drive.run_folder(name, store.run_id)
-            for name in (PREVIEWS_FOLDER, ACCEPTED_FOLDER)
-        }
+        accepted_folder = drive.run_folder(ACCEPTED_FOLDER, store.run_id)
         queued = []
         for sample in samples:
             if sample.ref_id in done:
@@ -215,7 +204,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("supabase-check", help="Check Supabase tables and required columns.")
     run = commands.add_parser("run", help="Curate targets read from Supabase.")
     run.add_argument(
-        "--targets", type=positive_int, default=10, help="Number of imported targets to process."
+        "--targets",
+        type=positive_int,
+        help="Number of imported targets to process; default: every target after --offset.",
     )
     run.add_argument(
         "--offset", type=nonnegative_int, default=0, help="Skip this many database targets."
@@ -297,7 +288,9 @@ def main(argv: list[str] | None = None) -> int:
             done = store.finished_targets(settings.max_rounds)
             print(f"Resuming run {store.run_id}: {len(done)} of {count} targets already finished.")
         available = store.annotation_count() - offset
-        if available < count:
+        if count is None:
+            count = available
+        if count < 1 or available < count:
             raise ValueError(
                 f"Only {max(0, available)} training targets available after offset {offset}. "
                 "Import more data or reduce --targets."

@@ -1,4 +1,5 @@
--- One row per `run` command: the models, IoU thresholds, target range, and execution status.
+-- One row per `run` command: the models, IoU thresholds, target range, worker count, and
+-- execution status. Deleting a run deletes its rounds (see 03_rounds.sql).
 -- Run after 00_normalized_bbox.sql.
 begin;
 
@@ -14,6 +15,7 @@ create table public.runs (
     max_rounds integer not null check (max_rounds between 1 and 20),
     target_offset integer not null check (target_offset >= 0),
     target_count integer not null check (target_count > 0),
+    workers integer not null check (workers between 1 and 8),
     status text not null default 'running' check (status in ('running', 'completed', 'error')),
     created_at timestamptz not null default now(),
     finished_at timestamptz

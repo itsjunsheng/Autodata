@@ -1,4 +1,4 @@
-# Render round previews in memory and explicitly export Qwen training data.
+# Render accepted rounds as PNGs in memory and explicitly export Qwen training data.
 
 import json
 import textwrap
@@ -22,34 +22,24 @@ def round_status(result: Result, current: Round) -> str:
     return "rejected" if current.feedback else "running"
 
 
-def render_round_preview(
-    image: Image.Image, sample: Sample, current: Round, status: str
-) -> Image.Image:
-    # The added text and coloured boxes are inspection aids, never training inputs.
+def render_accepted(image: Image.Image, sample: Sample, current: Round) -> bytes:
+    # A PNG of an accepted round: its referring expression above the image with the ground
+    # truth, weak and strong boxes drawn on. An inspection aid, never a training input.
     marked = image.copy()
     draw = ImageDraw.Draw(marked)
     # Different line widths keep all three colours visible when boxes coincide.
-    boxes = [(sample.target, "lime", 7)]
-    if current.weak:
-        boxes.append((current.weak.bbox, "red", 5))
-    if current.strong:
-        boxes.append((current.strong.bbox, "blue", 3))
-    for box, colour, width in boxes:
+    boxes = [
+        (sample.target, "lime", 7, "Ground"),
+        (current.weak.bbox, "red", 5, "Weak solver"),
+        (current.strong.bbox, "blue", 3, "Strong solver"),
+    ]
+    for box, colour, width, _ in boxes:
         draw.rectangle(box.pixels(*image.size), outline=colour, width=width)
 
     font = ImageFont.load_default(size=14)
-    legends = [
-        ("lime", "Ground"),
-        ("red", "Weak solver" + (" (not run)" if current.weak is None else "")),
-        ("blue", "Strong solver" + (" (not run)" if current.strong is None else "")),
-    ]
-    legend_width = sum(20 + font.getlength(label) + 24 for _, label in legends)
-    canvas_width = max(image.width, 400, int(legend_width + font.getlength(status.upper())) + 24)
-    referring_expression = (
-        current.candidate.referring_expression
-        if current.candidate
-        else "No referring expression generated."
-    )
+    legend_width = sum(20 + font.getlength(label) + 24 for _, _, _, label in boxes)
+    canvas_width = max(image.width, 400, int(legend_width) + 24)
+    referring_expression = current.candidate.referring_expression
     line_width = (canvas_width - 24) // 8
     lines = textwrap.wrap(referring_expression, width=line_width)
     while any(font.getlength(line) > canvas_width - 24 for line in lines):
@@ -63,12 +53,13 @@ def render_round_preview(
         draw.text((12, 12 + 20 * index), line, fill="black", font=font)
     legend_y = 20 + 20 * len(lines)
     x = 12
-    for colour, label in legends:
+    for _, colour, _, label in boxes:
         draw.rectangle((x, legend_y + 3, x + 12, legend_y + 13), fill=colour)
         draw.text((x + 20, legend_y), label, fill="black", font=font)
         x += 20 + font.getlength(label) + 24
-    draw.text((x, legend_y), status.upper(), fill="black", font=font)
-    return canvas
+    buffer = BytesIO()
+    canvas.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _training_record(example: AcceptedExample, image_path: str) -> dict:

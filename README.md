@@ -14,7 +14,7 @@ accepted ones as a Qwen training set.
 ## Getting started
 
 Requires Python 3.11+, OpenAI and OpenRouter API access, a Supabase project,
-and a Google Drive folder with three subfolders, `images`, `previews` and `accepted`.
+and a Google Drive folder with two subfolders, `images` and `accepted`.
 
 ### Python environment
 
@@ -62,7 +62,7 @@ credentials private.
 | Table | Stores |
 | --- | --- |
 | `refcoco_annotations` | One row per annotated object: `ref_id` (primary key), COCO image ID, category, image size, ground-truth box, the human referring expressions, and the Drive file ID of its image |
-| `runs` | One row per `run` command: models, IoU thresholds, target range, and status |
+| `runs` | One row per `run` command: models, IoU thresholds, target range, worker count, and status. Deleting a run deletes its rounds |
 | `rounds` | One row per loop round, keyed by run, `ref_id`, and round number: the generated referring expression, both solver boxes, IoUs, and the outcome. Rows with status `accepted` are the training examples |
 
 The schema is one SQL file per table in [supabase/](supabase/), plus the shared coordinate
@@ -79,9 +79,8 @@ python src/main.py supabase-check
 2. Configure the OAuth consent screen and create a **Desktop app** OAuth client.
    Add your account as a test user if the app is in testing mode.
 3. Save the downloaded client JSON to `credentials/google_client.json`.
-4. Create three folders named `images`, `previews` and `accepted` inside the project
-   folder. The code looks these up and creates one subfolder per run inside `previews`
-   and `accepted`.
+4. Create two folders named `images` and `accepted` inside the project folder. The code
+   looks these up and creates one subfolder per run inside `accepted`.
 5. Set `GOOGLE_DRIVE_FOLDER_ID` to the project folder's ID, then sign in and check:
 
 ```powershell
@@ -124,17 +123,18 @@ After an interrupted import, rerun the same command.
 ### Generate referring expressions
 
 ```powershell
-python src/main.py run --targets 10
+python src/main.py run
 ```
 
-Each target gets up to six rounds and stops when accepted. The command prints the run ID
-and links to round previews. Targets are processed in import order. A run that stops
-early continues under the same run ID with `--resume`: finished targets are skipped and
-unfinished ones, including those that ended in an error, are redone from round one, and
-their earlier rounds are removed. A rate-limited model call is retried for up to about
-twenty minutes, and a dropped or gateway-failed Supabase or Drive request for about two
-minutes, before either counts as an error. A model error marks that target's round
-`error` with the message in `feedback`, and the batch continues with the next target.
+This processes every imported target after `--offset`; `--targets N` limits the batch to
+the first N of them. Each target gets up to six rounds and stops when accepted. The command
+prints the run ID and a link to each accepted round's PNG. Targets are processed in import
+order. A run that stops early continues under the same run ID with `--resume`: finished
+targets are skipped and unfinished ones, including those that ended in an error, are redone
+from round one, and their earlier rounds are removed. A rate-limited model call is retried
+for up to about twenty minutes, and a dropped or gateway-failed Supabase or Drive request
+for about two minutes, before either counts as an error. A model error marks that target's
+round `error` with the message in `feedback`, and the batch continues with the next target.
 After three consecutive failed targets the batch stops and the run status is `error`.
 
 `AUTODATA_WORKERS` in `.env` sets how many targets are curated at the same time. Each
@@ -144,7 +144,7 @@ gain flattens above about four.
 
 | Option | Purpose |
 | --- | --- |
-| `--targets N` | Number of imported targets to process |
+| `--targets N` | Number of imported targets to process; default: every target after `--offset` |
 | `--offset N` | Skip N targets in import order |
 | `--resume RUN_ID` | Continue an interrupted run; its target range is reused |
 | `--dry-run` | Validate cloud inputs without model calls or output writes |
@@ -219,18 +219,15 @@ folders you created inside the project folder:
 ```text
 Drive root/
   images/581857.jpg
-  previews/<run id>/ref 0 round 1.png
   accepted/<run id>/ref 0 round 6.png
 ```
 
-`images/` holds one original per COCO image, named by its COCO image ID. `previews/`
-holds one folder per run, with one PNG per loop round named by RefCOCO ref ID and round
-number. `accepted/` holds a copy of each accepted round's preview, in a folder per run,
-for auditing by hand.
-
-Round previews show the referring expression, outcome, and boxes: **green** for
-ground truth, **red** for the weak solver, and **blue** for the strong solver.
-Training uses the clean original images. Import and generation store their results in
+`images/` holds one original per COCO image, named by its COCO image ID. `accepted/`
+holds one folder per run with one PNG per accepted round, named by RefCOCO ref ID and
+round number, for auditing by hand. Each PNG shows the referring expression above the
+image with its boxes: **green** for ground truth, **red** for the weak solver, and
+**blue** for the strong solver. Rejected and failed rounds are only logged in the `rounds`
+table. Training uses the clean original images. Import and generation store their results in
 the cloud; `export` explicitly creates local training files.
 
 Run one importing process at a time. Generation runs several targets at once inside one
@@ -252,7 +249,7 @@ Agent roles each have a module in `src/`: `main_agent.py`, `challenger.py`,
 | `model_client.py` | OpenAI and OpenRouter requests, model pre-flight checks, and provider errors |
 | `google_drive.py` | Google authentication and image storage |
 | `supabase_client.py` | Database access and round persistence |
-| `outputs.py` | Round previews and training export |
+| `outputs.py` | Accepted-round PNGs and training export |
 
 ```powershell
 python -m pip install -e ".[dev]"

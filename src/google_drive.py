@@ -1,6 +1,6 @@
-# Authenticate with Google; store originals in images/ and round previews in previews/ in Drive.
-# The user creates images/, previews/ and accepted/ by hand; the code creates only one folder
-# per run inside previews/ and accepted/.
+# Authenticate with Google; store originals in images/ and accepted rounds in accepted/ in Drive.
+# The user creates images/ and accepted/ by hand; the code creates only one folder per run
+# inside accepted/.
 
 import hashlib
 import os
@@ -25,7 +25,6 @@ from requests.exceptions import RequestException
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 IMAGES_FOLDER = "images"
-PREVIEWS_FOLDER = "previews"
 ACCEPTED_FOLDER = "accepted"
 IMAGE_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 RETRY_DELAYS = (2, 5, 15, 30, 60)  # seconds between attempts at a dropped request
@@ -159,10 +158,7 @@ class GoogleDrive:
             "connected": True,
             "folder_id": self.folder_id,
             "folder_name": folder["name"],
-            "folders": {
-                name: self._folder(name)
-                for name in (IMAGES_FOLDER, PREVIEWS_FOLDER, ACCEPTED_FOLDER)
-            },
+            "folders": {name: self._folder(name) for name in (IMAGES_FOLDER, ACCEPTED_FOLDER)},
         }
 
     def _find(self, parent_id: str, name: str) -> dict | None:
@@ -226,7 +222,7 @@ class GoogleDrive:
     def upload(
         self, parent: str, name: str, content: bytes, content_type: str, *, immutable: bool = False
     ) -> str:
-        # Reuse a matching original; update an existing round preview without making copies.
+        # Reuse a matching original; update an existing accepted round without making copies.
         if not name or "/" in name or "\\" in name:
             raise DriveError("Drive file names must not be empty or contain slashes.")
         found = self._find(parent, name)

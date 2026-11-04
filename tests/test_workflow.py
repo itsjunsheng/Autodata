@@ -51,7 +51,7 @@ def configure_cli(monkeypatch, memory, cloud, module="main"):
     monkeypatch.setattr(f"{module}.create_drive_client", lambda: cloud.drive)
 
 
-def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
+def test_cloud_loop_saves_original_boxes_and_accepted_round(
     sample_record, sample, image_bytes, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
@@ -71,30 +71,20 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     assert example.image_file_id == sample.image_file_id
     assert example.referring_expression == row["referring_expression"]
     assert cloud.contents[sample.image_file_id] == image_bytes
-    preview = cloud.objects[row["preview_file_id"]]
-    assert preview["name"] == "ref 1 round 1.png"
-    assert cloud.objects[preview["parents"][0]]["name"] == store.run_id
-    copies = [
-        value
-        for value in cloud.objects.values()
-        if value.get("name") == preview["name"] and value["id"] != preview["id"]
-    ]
-    assert len(copies) == 1
-    run_folder = cloud.objects[copies[0]["parents"][0]]
+    accepted = cloud.objects[row["accepted_file_id"]]
+    assert accepted["name"] == "ref 1 round 1.png"
+    run_folder = cloud.objects[accepted["parents"][0]]
     assert run_folder["name"] == store.run_id
     assert cloud.objects[run_folder["parents"][0]]["name"] == ACCEPTED_FOLDER
-    assert cloud.contents[copies[0]["id"]] == cloud.contents[preview["id"]]
-    with Image.open(BytesIO(cloud.contents[row["preview_file_id"]])) as preview:
-        left = (preview.width - sample.width) // 2
-        marked = preview.crop(
-            (left, preview.height - sample.height, left + sample.width, preview.height)
-        )
+    with Image.open(BytesIO(cloud.contents[accepted["id"]])) as png:
+        left = (png.width - sample.width) // 2
+        marked = png.crop((left, png.height - sample.height, left + sample.width, png.height))
         assert marked.getpixel((40, 25)) == (0, 255, 0)
         assert marked.getpixel((140, 10)) == (255, 0, 0)
         assert marked.getpixel((40, 20)) == (0, 0, 255)
     assert memory.tables["runs"][store.run_id]["status"] == "completed"
     assert memory.tables["runs"][store.run_id]["finished_at"]
-    assert sum(method == "PUT" for method, _ in cloud.requests) == 2  # preview and accepted copy
+    assert sum(method == "PUT" for method, _ in cloud.requests) == 1  # the accepted PNG
     folders = [
         row
         for row in cloud.objects.values()
@@ -102,7 +92,6 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     ]
     assert {row["name"] for row in folders if row.get("parents") == ["root-folder"]} == {
         "images",
-        "previews",
         "accepted",
     }
     training_dir = tmp_path / "training"
@@ -115,7 +104,7 @@ def test_cloud_loop_saves_original_boxes_round_preview_and_accepted_round(
     assert (training_dir / training[0]["images"][0]).read_bytes() == image_bytes
 
 
-def test_rejected_and_accepted_rounds_have_separate_previews(sample_record, sample, image_bytes):
+def test_rejected_rounds_are_logged_without_a_drive_file(sample_record, sample, image_bytes):
     memory, cloud, store = cloud_for(sample_record, image_bytes)
     roles = ScriptedRoles(
         sample, [sample.target, wrong_box()], settings=make_settings(max_rounds=3)
@@ -126,25 +115,23 @@ def test_rejected_and_accepted_rounds_have_separate_previews(sample_record, samp
     assert saved[0]["weak_iou"] == 1
     assert saved[0]["strong_iou"] is None and saved[0]["strong_bbox_2d"] is None
     assert saved[1]["weak_iou"] == 0
-    assert len({row["preview_file_id"] for row in saved}) == 2
+    assert saved[0]["accepted_file_id"] is None
+    assert cloud.objects[saved[1]["accepted_file_id"]]["name"] == "ref 1 round 2.png"
+    assert sum(method == "PUT" for method, _ in cloud.requests) == 1
     assert len(accepted_rounds(memory)) == 1
 
 
-def test_previews_are_named_by_ref_id_and_do_not_overwrite_shared_images(
-    sample_record, sample, image_bytes
-):
+def test_accepted_files_are_named_by_ref_id_and_round(sample_record, sample, image_bytes):
     memory, cloud, store = cloud_for(sample_record, image_bytes)
     memory.seed(sample_record.model_copy(update={"ref_id": 2}))
     roles = ScriptedRoles(sample, [sample.target, wrong_box(), wrong_box()])
     run_batch(store.iter_samples(2), 2, roles.main, store, cloud.drive)
     saved = list(memory.tables["rounds"].values())
-    assert [cloud.objects[row["preview_file_id"]]["name"] for row in saved] == [
-        "ref 1 round 1.png",
-        "ref 1 round 2.png",
-        "ref 2 round 1.png",
-    ]
-    assert len({row["preview_file_id"] for row in saved}) == 3
     assert [row["round_number"] for row in saved] == [1, 2, 1]
+    assert [row["status"] for row in saved] == ["rejected", "accepted", "accepted"]
+    assert [
+        cloud.objects[row["accepted_file_id"]]["name"] for row in saved if row["accepted_file_id"]
+    ] == ["ref 1 round 2.png", "ref 2 round 1.png"]
 
 
 def test_no_accepted_round_keeps_rounds_rejected_and_export_empty(
@@ -209,7 +196,7 @@ def test_model_failure_is_recorded_and_the_batch_continues(sample_record, sample
     assert saved[0]["referring_expression"] is None
     assert saved[0]["weak_bbox_2d"] is None
     assert saved[0]["feedback"] == "Challenger unavailable"
-    assert saved[0]["preview_file_id"]
+    assert saved[0]["accepted_file_id"] is None
     assert memory.tables["runs"][store.run_id]["status"] == "completed"
     assert len(accepted_rounds(memory)) == 1
 
@@ -250,8 +237,9 @@ def test_workers_curate_targets_at_the_same_time(sample_record, sample, image_by
     summary = run_batch(store.iter_samples(2), 2, roles.main, store, cloud.drive)
     assert summary["accepted"] == 2 and summary["status"] == "completed"
     assert [row["status"] for row in memory.tables["rounds"].values()] == ["accepted", "accepted"]
+    assert memory.tables["runs"][store.run_id]["workers"] == 2
     run_folders = [row for row in cloud.folder_creates if row["name"] == store.run_id]
-    assert len(run_folders) == 2
+    assert len(run_folders) == 1  # one accepted/<run id> folder, created once
 
 
 @pytest.mark.parametrize("failure", ["image", "database"])
@@ -394,9 +382,21 @@ def test_empty_database_fails_before_model_calls(monkeypatch, tmp_path, capsys):
     configure_cli(monkeypatch, memory, cloud)
     monkeypatch.setattr("main.OpenAIClient", lambda *args: pytest.fail("No data available"))
     monkeypatch.setattr("main.OpenRouterClient", lambda *args: pytest.fail("No data available"))
-    assert main(["run", "--targets", "1"]) == 1
+    assert main(["run"]) == 1
     assert "Import more data" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
+
+
+def test_run_defaults_to_every_target_after_the_offset(
+    sample_record, image_bytes, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    memory, cloud, _ = cloud_for(sample_record, image_bytes)
+    for ref_id in (2, 3):
+        memory.seed(sample_record.model_copy(update={"ref_id": ref_id}))
+    configure_cli(monkeypatch, memory, cloud)
+    assert main(["run", "--offset", "1", "--dry-run"]) == 0
+    assert "Validated 2 cloud targets" in capsys.readouterr().out
 
 
 def test_local_training_export_paginates_and_downloads_original_once(
